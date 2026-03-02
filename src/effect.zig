@@ -86,6 +86,7 @@ pub fn Cont(comptime E: type) type {
         fiber: *EffectFiber,
         resume_ptr: ?*anyopaque,
         alive: bool = true,
+        delegated: bool = false,
         next_effect: ?RawEffect = null,
 
         const Self = @This();
@@ -93,8 +94,9 @@ pub fn Cont(comptime E: type) type {
         // The continuation is only valid for the duration of the handler
         // call. It is stack-allocated inside the erased wrapper and
         // cannot be stored, returned, or accessed after the handler
-        // returns. If the handler returns without calling resume() or
-        // drop(), the wrapper auto-drops (destroying the fiber).
+        // returns. If the handler returns without calling resume(),
+        // drop(), or delegate(), the wrapper auto-drops (destroying the
+        // fiber).
         //
         // Handlers may perform blocking or async IO (e.g. via std.Io)
         // before resuming. The fiber's stack is untouched during this
@@ -127,6 +129,14 @@ pub fn Cont(comptime E: type) type {
             if (!self.alive) return;
             self.alive = false;
             self.fiber.deinit();
+        }
+
+        /// Delegate the effect to the parent handler scope. The
+        /// handler is saying "I can't handle this, pass it up."
+        /// The dispatch loop will continue searching parent layers.
+        pub fn delegate(self: *Self) void {
+            std.debug.assert(self.alive); // can't delegate after resume/drop
+            self.delegated = true;
         }
 
         pub fn isAlive(self: *const Self) bool {
@@ -191,7 +201,12 @@ pub fn EmitHandlerFn(comptime E: type) type {
 // §6. HandlerSet — type-safe binding, type-erased storage
 // ============================================================
 
-const ErasedHandlerFn = *const fn (raw: *const RawEffect, fiber: *EffectFiber, ctx: ?*anyopaque) ?RawEffect;
+const HandlerResult = union(enum) {
+    handled: ?RawEffect,
+    skipped,
+};
+
+const ErasedHandlerFn = *const fn (raw: *const RawEffect, fiber: *EffectFiber, ctx: ?*anyopaque) HandlerResult;
 
 const Binding = struct {
     id: usize,
@@ -203,6 +218,7 @@ const Binding = struct {
 pub const HandlerSet = struct {
     bindings: std.ArrayListUnmanaged(Binding),
     allocator: std.mem.Allocator,
+    parent: ?*const HandlerSet = null,
 
     pub fn init(allocator: std.mem.Allocator) HandlerSet {
         return .{ .bindings = .{}, .allocator = allocator };
@@ -212,23 +228,28 @@ pub const HandlerSet = struct {
         self.bindings.deinit(self.allocator);
     }
 
+    pub fn setParent(self: *HandlerSet, p: *const HandlerSet) void {
+        self.parent = p;
+    }
+
     /// Bind a typed perform handler. Compile error if handler
     /// signature doesn't match E's value and resume types.
     pub fn onPerform(self: *HandlerSet, comptime E: type, handler: PerformHandlerFn(E), ctx: ?*anyopaque) void {
         const Gen = struct {
-            fn erased(raw: *const RawEffect, fiber: *EffectFiber, user_ctx: ?*anyopaque) ?RawEffect {
+            fn erased(raw: *const RawEffect, fiber: *EffectFiber, user_ctx: ?*anyopaque) HandlerResult {
                 const val: *E.Value = @ptrCast(@alignCast(raw.value_ptr));
                 var cont = Cont(E){
                     .fiber = fiber,
                     .resume_ptr = raw.resume_ptr,
                 };
                 handler(val, &cont, user_ctx);
+                if (cont.delegated) return .skipped;
                 if (cont.alive) {
-                    // Handler returned without resuming or dropping.
+                    // Handler returned without resuming, dropping, or delegating.
                     // Drop the fiber to prevent leaks.
                     cont.drop();
                 }
-                return cont.next_effect;
+                return .{ .handled = cont.next_effect };
             }
         };
         self.bindings.append(self.allocator, .{
@@ -243,10 +264,10 @@ pub const HandlerSet = struct {
     /// signature doesn't match E's value type.
     pub fn onEmit(self: *HandlerSet, comptime E: type, handler: EmitHandlerFn(E), ctx: ?*anyopaque) void {
         const Gen = struct {
-            fn erased(raw: *const RawEffect, _: *EffectFiber, user_ctx: ?*anyopaque) ?RawEffect {
+            fn erased(raw: *const RawEffect, _: *EffectFiber, user_ctx: ?*anyopaque) HandlerResult {
                 const val: *const E.Value = @ptrCast(@alignCast(raw.value_ptr));
                 handler(val, user_ctx);
-                return null; // emit handlers don't produce next effects
+                return .{ .handled = null };
             }
         };
         self.bindings.append(self.allocator, .{
@@ -262,29 +283,48 @@ pub const HandlerSet = struct {
 // §7. Runner
 // ============================================================
 
+/// Walk the handler chain (child → parent) looking for a perform handler.
+/// Returns the next effect from the handler that accepted, or resumes with
+/// a zeroed value if the chain is exhausted.
+fn dispatchPerform(eff: *const RawEffect, fiber: *EffectFiber, handlers: *const HandlerSet) ?RawEffect {
+    var level: ?*const HandlerSet = handlers;
+    while (level) |hs| : (level = hs.parent) {
+        for (hs.bindings.items) |binding| {
+            if (binding.kind == .perform and binding.id == eff.id) {
+                switch (binding.handler(eff, fiber, binding.ctx)) {
+                    .handled => |next| return next,
+                    .skipped => {},
+                }
+            }
+        }
+    }
+    // Chain exhausted — no handler accepted. Resume with zeroed value.
+    return fiber.resumeVoid();
+}
+
+/// Walk the entire handler chain, calling ALL matching emit observers at
+/// every level. Child-level observers run first, then parent, then grandparent.
+fn dispatchEmit(eff: *const RawEffect, fiber: *EffectFiber, handlers: *const HandlerSet) void {
+    var level: ?*const HandlerSet = handlers;
+    while (level) |hs| : (level = hs.parent) {
+        for (hs.bindings.items) |binding| {
+            if (binding.kind == .emit and binding.id == eff.id) {
+                _ = binding.handler(eff, fiber, binding.ctx);
+            }
+        }
+    }
+}
+
 pub fn run(fib: *EffectFiber, handlers: *const HandlerSet) void {
     var maybe_eff = fib.start();
     while (maybe_eff) |eff| {
         switch (eff.kind) {
             .emit => {
-                for (handlers.bindings.items) |binding| {
-                    if (binding.kind == .emit and binding.id == eff.id) {
-                        _ = binding.handler(&eff, fib, binding.ctx);
-                    }
-                }
+                dispatchEmit(&eff, fib, handlers);
                 maybe_eff = fib.resumeVoid();
             },
             .perform => {
-                for (handlers.bindings.items) |binding| {
-                    if (binding.kind == .perform and binding.id == eff.id) {
-                        const result = binding.handler(&eff, fib, binding.ctx);
-                        maybe_eff = result;
-                        break;
-                    }
-                } else {
-                    // No handler found — resume with zeroed value
-                    maybe_eff = fib.resumeVoid();
-                }
+                maybe_eff = dispatchPerform(&eff, fib, handlers);
             },
         }
     }
@@ -499,4 +539,216 @@ test "multiple emit observers for same effect" {
 
     try testing.expectEqual(@as(usize, 1), state.a);
     try testing.expectEqual(@as(usize, 1), state.b);
+}
+
+// ============================================================
+// §9. Delegation tests
+// ============================================================
+
+test "child delegates perform to parent" {
+    const Fetch = Perform([]const u8, i32);
+
+    var fib = try initFiberDefault(&struct {
+        fn body(ctx: *EffectContext) void {
+            const val = ctx.perform(Fetch, "key");
+            std.debug.assert(val == 99);
+        }
+    }.body);
+    defer fib.deinit();
+
+    // Child: delegates everything
+    var child = HandlerSet.init(testing.allocator);
+    defer child.deinit();
+    child.onPerform(Fetch, &struct {
+        fn handle(_: *Fetch.Value, cont: *Cont(Fetch), _: ?*anyopaque) void {
+            cont.delegate();
+        }
+    }.handle, null);
+
+    // Parent: handles with 99
+    var parent = HandlerSet.init(testing.allocator);
+    defer parent.deinit();
+    parent.onPerform(Fetch, &struct {
+        fn handle(_: *Fetch.Value, cont: *Cont(Fetch), _: ?*anyopaque) void {
+            cont.@"resume"(99);
+        }
+    }.handle, null);
+
+    child.setParent(&parent);
+    run(&fib, &child);
+
+    try testing.expect(!fib.isAlive());
+}
+
+test "conditional delegation (cache pattern)" {
+    const Lookup = Perform([]const u8, i32);
+    const Result = Emit(i32);
+
+    const State = struct { results: [2]i32 = .{ 0, 0 }, idx: usize = 0 };
+    var state = State{};
+
+    var fib = try initFiberDefault(&struct {
+        fn body(ctx: *EffectContext) void {
+            const a = ctx.perform(Lookup, "cached");
+            ctx.emit(Result, a);
+            const b = ctx.perform(Lookup, "miss");
+            ctx.emit(Result, b);
+        }
+    }.body);
+    defer fib.deinit();
+
+    // Child: cache layer — handles "cached", delegates others
+    var cache = HandlerSet.init(testing.allocator);
+    defer cache.deinit();
+    cache.onPerform(Lookup, &struct {
+        fn handle(key: *Lookup.Value, cont: *Cont(Lookup), _: ?*anyopaque) void {
+            if (std.mem.eql(u8, key.*, "cached")) {
+                cont.@"resume"(10); // cache hit
+            } else {
+                cont.delegate(); // cache miss → parent
+            }
+        }
+    }.handle, null);
+
+    cache.onEmit(Result, &struct {
+        fn handle(val: *const Result.Value, raw_ctx: ?*anyopaque) void {
+            const s: *State = @ptrCast(@alignCast(raw_ctx.?));
+            s.results[s.idx] = val.*;
+            s.idx += 1;
+        }
+    }.handle, @ptrCast(&state));
+
+    // Parent: DB layer — always returns 42
+    var db = HandlerSet.init(testing.allocator);
+    defer db.deinit();
+    db.onPerform(Lookup, &struct {
+        fn handle(_: *Lookup.Value, cont: *Cont(Lookup), _: ?*anyopaque) void {
+            cont.@"resume"(42); // DB result
+        }
+    }.handle, null);
+
+    cache.setParent(&db);
+    run(&fib, &cache);
+
+    try testing.expectEqual(@as(i32, 10), state.results[0]); // cache hit
+    try testing.expectEqual(@as(i32, 42), state.results[1]); // DB fallback
+}
+
+test "emit propagates to all layers" {
+    const Ping = Emit(void);
+
+    const State = struct { child_count: usize = 0, parent_count: usize = 0 };
+    var state = State{};
+
+    var fib = try initFiberDefault(&struct {
+        fn body(ctx: *EffectContext) void {
+            ctx.emit(Ping, {});
+            ctx.emit(Ping, {});
+        }
+    }.body);
+    defer fib.deinit();
+
+    var child = HandlerSet.init(testing.allocator);
+    defer child.deinit();
+    child.onEmit(Ping, &struct {
+        fn handle(_: *const Ping.Value, raw_ctx: ?*anyopaque) void {
+            const s: *State = @ptrCast(@alignCast(raw_ctx.?));
+            s.child_count += 1;
+        }
+    }.handle, @ptrCast(&state));
+
+    var parent = HandlerSet.init(testing.allocator);
+    defer parent.deinit();
+    parent.onEmit(Ping, &struct {
+        fn handle(_: *const Ping.Value, raw_ctx: ?*anyopaque) void {
+            const s: *State = @ptrCast(@alignCast(raw_ctx.?));
+            s.parent_count += 1;
+        }
+    }.handle, @ptrCast(&state));
+
+    child.setParent(&parent);
+    run(&fib, &child);
+
+    try testing.expectEqual(@as(usize, 2), state.child_count);
+    try testing.expectEqual(@as(usize, 2), state.parent_count);
+}
+
+test "three-level delegation chain" {
+    const Ask = Perform(u8, u8);
+
+    var fib = try initFiberDefault(&struct {
+        fn body(ctx: *EffectContext) void {
+            const val = ctx.perform(Ask, 1);
+            std.debug.assert(val == 77);
+        }
+    }.body);
+    defer fib.deinit();
+
+    // Level 1 (innermost): delegates
+    var l1 = HandlerSet.init(testing.allocator);
+    defer l1.deinit();
+    l1.onPerform(Ask, &struct {
+        fn handle(_: *Ask.Value, cont: *Cont(Ask), _: ?*anyopaque) void {
+            cont.delegate();
+        }
+    }.handle, null);
+
+    // Level 2 (middle): also delegates
+    var l2 = HandlerSet.init(testing.allocator);
+    defer l2.deinit();
+    l2.onPerform(Ask, &struct {
+        fn handle(_: *Ask.Value, cont: *Cont(Ask), _: ?*anyopaque) void {
+            cont.delegate();
+        }
+    }.handle, null);
+
+    // Level 3 (outermost): handles
+    var l3 = HandlerSet.init(testing.allocator);
+    defer l3.deinit();
+    l3.onPerform(Ask, &struct {
+        fn handle(_: *Ask.Value, cont: *Cont(Ask), _: ?*anyopaque) void {
+            cont.@"resume"(77);
+        }
+    }.handle, null);
+
+    l1.setParent(&l2);
+    l2.setParent(&l3);
+    run(&fib, &l1);
+
+    try testing.expect(!fib.isAlive());
+}
+
+test "auto-drop preserved with delegation in chain" {
+    const Oops = Perform(u8, u8);
+
+    var fib = try initFiberDefault(&struct {
+        fn body(ctx: *EffectContext) void {
+            _ = ctx.perform(Oops, 1);
+            @panic("unreachable after auto-drop");
+        }
+    }.body);
+    defer fib.deinit();
+
+    // Child: delegates
+    var child = HandlerSet.init(testing.allocator);
+    defer child.deinit();
+    child.onPerform(Oops, &struct {
+        fn handle(_: *Oops.Value, cont: *Cont(Oops), _: ?*anyopaque) void {
+            cont.delegate();
+        }
+    }.handle, null);
+
+    // Parent: forgets to resume/drop — should auto-drop
+    var parent = HandlerSet.init(testing.allocator);
+    defer parent.deinit();
+    parent.onPerform(Oops, &struct {
+        fn handle(_: *Oops.Value, _: *Cont(Oops), _: ?*anyopaque) void {
+            // Intentionally do nothing — should auto-drop.
+        }
+    }.handle, null);
+
+    child.setParent(&parent);
+    run(&fib, &child);
+
+    try testing.expect(!fib.isAlive());
 }
