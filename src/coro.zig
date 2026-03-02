@@ -1,5 +1,3 @@
-// vrtl/src/coro.zig
-//
 // Low-level Zig bindings to minicoro. Thin wrapper — exposes the
 // minicoro API with Zig types. Higher-level Fiber and Effect APIs
 // build on top of this.

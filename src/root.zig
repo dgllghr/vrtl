@@ -3,6 +3,7 @@ const std = @import("std");
 
 const coro = @import("coro.zig");
 pub const fiber = @import("fiber.zig");
+pub const effect = @import("effect.zig");
 
 pub fn bufferedPrint() !void {
     // Stdout is for the actual output of your application, for example if you

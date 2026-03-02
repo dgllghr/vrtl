@@ -86,8 +86,12 @@ pub fn Fiber(comptime YieldT: type, comptime ResumeT: type) type {
             return init(body, 0); // 0 = use minicoro default
         }
 
-        /// Destroy the fiber and free its stack.
+        /// Destroy the fiber and free its stack. Idempotent —
+        /// safe to call more than once (e.g. after a handler drops
+        /// the continuation).
         pub fn deinit(self: *Self) void {
+            if (self.state == .dead) return;
+            self.state = .dead;
             coro.destroy(self.co) catch {};
         }
 
