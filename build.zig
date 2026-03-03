@@ -162,4 +162,27 @@ pub fn build(b: *std.Build) void {
     //
     // Lastly, the Zig build system is relatively simple and self-contained,
     // and reading its source code will allow you to master it.
+
+    // Benchmarks — always built with ReleaseFast.
+    const bench_exe = b.addExecutable(.{
+        .name = "bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+        }),
+    });
+    bench_exe.root_module.addCSourceFile(.{
+        .file = b.path("c/minicoro.h"),
+        .flags = &.{"-DMINICORO_IMPL"},
+        .language = .c,
+    });
+    bench_exe.root_module.addIncludePath(b.path("c"));
+    bench_exe.root_module.link_libc = true;
+    b.installArtifact(bench_exe);
+
+    const run_bench = b.addRunArtifact(bench_exe);
+    run_bench.step.dependOn(b.getInstallStep());
+    const bench_step = b.step("bench", "Run benchmarks");
+    bench_step.dependOn(&run_bench.step);
 }
