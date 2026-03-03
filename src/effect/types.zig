@@ -20,7 +20,7 @@ pub fn Emit(comptime T: type) type {
     };
 }
 
-pub const EffectKind = enum(u8) { perform, emit };
+pub const EffectKind = enum(u8) { perform, emit, io_wait };
 
 pub fn effectId(comptime E: type) usize {
     return @intFromPtr(@typeName(E).ptr);
@@ -31,10 +31,10 @@ pub fn effectId(comptime E: type) usize {
 // ============================================================
 
 pub const RawEffect = struct {
-    id: usize,
+    id: usize = 0,
     kind: EffectKind,
-    value_ptr: *anyopaque,
-    value_size: usize,
+    value_ptr: *anyopaque = undefined,
+    value_size: usize = 0,
     /// For perform: pointer to the resume slot on the performer's
     /// stack frame. The continuation writes the resume value here.
     resume_ptr: ?*anyopaque = null,
@@ -70,11 +70,19 @@ pub fn initFiberDefault(body: EffectBodyFn) !EffectFiber {
 // §4. EffectContext — used inside effectful fiber bodies
 // ============================================================
 
+pub const has_std_io = @hasDecl(std.Io, "VTable");
+
 pub const EffectContext = struct {
     handle: *EffectFiber.Handle,
+    io: if (has_std_io) std.Io else void = if (has_std_io) .{ .userdata = null, .vtable = undefined } else {},
 
     pub fn init(handle: *EffectFiber.Handle) EffectContext {
         return .{ .handle = handle };
+    }
+
+    pub fn initWithIo(handle: *EffectFiber.Handle, io_instance: std.Io) EffectContext {
+        if (!has_std_io) return .{ .handle = handle };
+        return .{ .handle = handle, .io = io_instance };
     }
 
     /// Perform: transfer ownership, suspend, receive a resume value.

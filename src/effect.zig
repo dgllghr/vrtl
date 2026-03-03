@@ -38,6 +38,14 @@ pub const HandlerSet = handler_mod.HandlerSet;
 pub const run = dispatch_mod.run;
 pub const Scheduler = dispatch_mod.Scheduler;
 
+// IO scheduling (Zig 0.16+ with std.Io.VTable)
+const io_mod = @import("io.zig");
+pub const has_std_io = types.has_std_io;
+pub const FiberIo = io_mod.FiberIo;
+pub const IoScheduler = io_mod.IoScheduler;
+pub const IoFiberResult = io_mod.IoFiberResult;
+pub const initIoFiber = io_mod.initIoFiber;
+
 // ============================================================
 // §8. Tests
 // ============================================================

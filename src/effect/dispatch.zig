@@ -15,7 +15,7 @@ const HandlerFiberCtx = handler_mod.HandlerFiberCtx;
 /// Walk the handler chain (child → parent) looking for a perform handler.
 /// Returns the next effect from the handler that accepted, or resumes with
 /// a zeroed value if the chain is exhausted.
-fn dispatchPerform(eff: *const RawEffect, fiber: *EffectFiber, handlers: *const HandlerSet) ?RawEffect {
+pub fn dispatchPerform(eff: *const RawEffect, fiber: *EffectFiber, handlers: *const HandlerSet) ?RawEffect {
     var level: ?*const HandlerSet = handlers;
     while (level) |hs| : (level = hs.parent) {
         for (hs.bindings.items) |binding| {
@@ -33,7 +33,7 @@ fn dispatchPerform(eff: *const RawEffect, fiber: *EffectFiber, handlers: *const 
 
 /// Walk the entire handler chain, calling ALL matching emit observers at
 /// every level. Child-level observers run first, then parent, then grandparent.
-fn dispatchEmit(eff: *const RawEffect, fiber: *EffectFiber, handlers: *const HandlerSet) void {
+pub fn dispatchEmit(eff: *const RawEffect, fiber: *EffectFiber, handlers: *const HandlerSet) void {
     var level: ?*const HandlerSet = handlers;
     while (level) |hs| : (level = hs.parent) {
         for (hs.bindings.items) |binding| {
@@ -55,6 +55,7 @@ pub fn run(fib: *EffectFiber, handlers: *const HandlerSet) void {
             .perform => {
                 maybe_eff = dispatchPerform(&eff, fib, handlers);
             },
+            .io_wait => unreachable, // io_wait is only valid inside IoScheduler
         }
     }
 }
@@ -85,6 +86,7 @@ pub const Scheduler = struct {
                 .perform => {
                     maybe_eff = self.dispatchPerformScheduled(&eff, fib, handlers);
                 },
+                .io_wait => unreachable, // io_wait is only valid inside IoScheduler
             }
         }
     }
@@ -135,6 +137,7 @@ pub const Scheduler = struct {
                             .perform => {
                                 heff = self.dispatchPerformScheduled(&h, &hfib, hs.parent);
                             },
+                            .io_wait => unreachable,
                         }
                     }
 
