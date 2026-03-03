@@ -8,327 +8,35 @@
 // Handler binding is type-checked at compile time.
 
 const std = @import("std");
-const fiber_mod = @import("fiber.zig");
 
-// ============================================================
-// §1. Effect type declarations
-// ============================================================
+const types = @import("effect/types.zig");
+const cont_mod = @import("effect/cont.zig");
+const handler_mod = @import("effect/handler.zig");
+const dispatch_mod = @import("effect/dispatch.zig");
 
-pub fn Perform(comptime T: type, comptime R: type) type {
-    return struct {
-        pub const Value = T;
-        pub const Resume = R;
-        pub const kind: EffectKind = .perform;
-    };
-}
+// Re-export all public symbols
 
-pub fn Emit(comptime T: type) type {
-    return struct {
-        pub const Value = T;
-        pub const kind: EffectKind = .emit;
-    };
-}
+pub const Perform = types.Perform;
+pub const Emit = types.Emit;
+pub const EffectKind = types.EffectKind;
+pub const effectId = types.effectId;
+pub const RawEffect = types.RawEffect;
+pub const EffectFiber = types.EffectFiber;
+pub const EffectBodyFn = types.EffectBodyFn;
+pub const initFiber = types.initFiber;
+pub const initFiberDefault = types.initFiberDefault;
+pub const EffectContext = types.EffectContext;
 
-pub const EffectKind = enum(u8) { perform, emit };
+pub const Cont = cont_mod.Cont;
+pub const SchedulerCont = cont_mod.SchedulerCont;
 
-fn effectId(comptime E: type) usize {
-    return @intFromPtr(&struct { const _: type = E; }._);
-}
+pub const PerformHandlerFn = handler_mod.PerformHandlerFn;
+pub const EmitHandlerFn = handler_mod.EmitHandlerFn;
+pub const EffectfulHandlerFn = handler_mod.EffectfulHandlerFn;
+pub const HandlerSet = handler_mod.HandlerSet;
 
-// ============================================================
-// §2. RawEffect — type-erased, yielded through the fiber
-// ============================================================
-
-pub const RawEffect = struct {
-    id: usize,
-    kind: EffectKind,
-    value_ptr: *anyopaque,
-    value_size: usize,
-    /// For perform: pointer to the resume slot on the performer's
-    /// stack frame. The continuation writes the resume value here.
-    resume_ptr: ?*anyopaque = null,
-};
-
-pub const EffectFiber = fiber_mod.Fiber(RawEffect, void);
-pub const EffectBodyFn = *const fn (*EffectContext) void;
-
-/// Create an effect fiber from a body that receives an EffectContext
-/// directly. Equivalent to EffectFiber.init with a wrapper that
-/// constructs the context.
-pub fn initFiber(body: EffectBodyFn, stack_size: usize) !EffectFiber {
-    const Static = struct {
-        threadlocal var current_body: EffectBodyFn = undefined;
-    };
-    Static.current_body = body;
-
-    return EffectFiber.init(&struct {
-        fn wrapper(h: *EffectFiber.Handle) void {
-            const b = Static.current_body;
-            var ctx = EffectContext.init(h);
-            b(&ctx);
-        }
-    }.wrapper, stack_size);
-}
-
-/// Create an effect fiber with the default stack size.
-pub fn initFiberDefault(body: EffectBodyFn) !EffectFiber {
-    return initFiber(body, 0);
-}
-
-// ============================================================
-// §3. Continuation — typed, given to perform handlers
-// ============================================================
-
-pub fn Cont(comptime E: type) type {
-    const R = E.Resume;
-
-    return struct {
-        fiber: *EffectFiber,
-        resume_ptr: ?*anyopaque,
-        alive: bool = true,
-        delegated: bool = false,
-        next_effect: ?RawEffect = null,
-
-        const Self = @This();
-
-        // The continuation is only valid for the duration of the handler
-        // call. It is stack-allocated inside the erased wrapper and
-        // cannot be stored, returned, or accessed after the handler
-        // returns. If the handler returns without calling resume(),
-        // drop(), or delegate(), the wrapper auto-drops (destroying the
-        // fiber).
-        //
-        // Handlers may perform blocking or async IO (e.g. via std.Io)
-        // before resuming. The fiber's stack is untouched during this
-        // time — std.Io operates on the handler's own stack. When the
-        // handler's IO completes and it calls resume(), the fiber
-        // continues normally.
-
-        /// Resume the performer, delivering a value.
-        pub fn @"resume"(self: *Self, val: R) void {
-            if (!self.alive) return;
-            self.alive = false;
-            if (@sizeOf(R) > 0) {
-                if (self.resume_ptr) |ptr| {
-                    const slot: *R = @ptrCast(@alignCast(ptr));
-                    slot.* = val;
-                }
-            }
-            self.next_effect = self.fiber.resumeVoid();
-        }
-
-        /// Drop the continuation without resuming. The fiber is
-        /// destroyed and its stack freed. The performer never returns
-        /// from perform().
-        ///
-        /// Warning: defers and destructors in the fiber will NOT run.
-        /// Resources held across a perform boundary will leak. Use
-        /// arena allocators for memory, and avoid holding file handles
-        /// or locks across perform calls.
-        pub fn drop(self: *Self) void {
-            if (!self.alive) return;
-            self.alive = false;
-            self.fiber.deinit();
-        }
-
-        /// Delegate the effect to the parent handler scope. The
-        /// handler is saying "I can't handle this, pass it up."
-        /// The dispatch loop will continue searching parent layers.
-        pub fn delegate(self: *Self) void {
-            std.debug.assert(self.alive); // can't delegate after resume/drop
-            self.delegated = true;
-        }
-
-        pub fn isAlive(self: *const Self) bool {
-            return self.alive;
-        }
-    };
-}
-
-// ============================================================
-// §4. EffectContext — used inside effectful fiber bodies
-// ============================================================
-
-pub const EffectContext = struct {
-    handle: *EffectFiber.Handle,
-
-    pub fn init(handle: *EffectFiber.Handle) EffectContext {
-        return .{ .handle = handle };
-    }
-
-    /// Perform: transfer ownership, suspend, receive a resume value.
-    pub fn perform(self: *EffectContext, comptime E: type, val: E.Value) E.Resume {
-        comptime std.debug.assert(E.kind == .perform);
-        var storage: E.Value = val;
-        var result: E.Resume = undefined;
-        _ = self.handle.yield(.{
-            .id = effectId(E),
-            .kind = .perform,
-            .value_ptr = @ptrCast(&storage),
-            .value_size = @sizeOf(E.Value),
-            .resume_ptr = if (@sizeOf(E.Resume) > 0) @ptrCast(&result) else null,
-        });
-        return result;
-    }
-
-    /// Emit: yield to observers, then resume. Synchronous from
-    /// the fiber's perspective — returns once all observers run.
-    pub fn emit(self: *EffectContext, comptime E: type, val: E.Value) void {
-        comptime std.debug.assert(E.kind == .emit);
-        var storage: E.Value = val;
-        _ = self.handle.yield(.{
-            .id = effectId(E),
-            .kind = .emit,
-            .value_ptr = @ptrCast(&storage),
-            .value_size = @sizeOf(E.Value),
-        });
-    }
-};
-
-// ============================================================
-// §5. Handler types
-// ============================================================
-
-pub fn PerformHandlerFn(comptime E: type) type {
-    return *const fn (value: *E.Value, cont: *Cont(E), ctx: ?*anyopaque) void;
-}
-
-pub fn EmitHandlerFn(comptime E: type) type {
-    return *const fn (value: *const E.Value, ctx: ?*anyopaque) void;
-}
-
-// ============================================================
-// §6. HandlerSet — type-safe binding, type-erased storage
-// ============================================================
-
-const HandlerResult = union(enum) {
-    handled: ?RawEffect,
-    skipped,
-};
-
-const ErasedHandlerFn = *const fn (raw: *const RawEffect, fiber: *EffectFiber, ctx: ?*anyopaque) HandlerResult;
-
-const Binding = struct {
-    id: usize,
-    kind: EffectKind,
-    handler: ErasedHandlerFn,
-    ctx: ?*anyopaque,
-};
-
-pub const HandlerSet = struct {
-    bindings: std.ArrayListUnmanaged(Binding),
-    allocator: std.mem.Allocator,
-    parent: ?*const HandlerSet = null,
-
-    pub fn init(allocator: std.mem.Allocator) HandlerSet {
-        return .{ .bindings = .{}, .allocator = allocator };
-    }
-
-    pub fn deinit(self: *HandlerSet) void {
-        self.bindings.deinit(self.allocator);
-    }
-
-    pub fn setParent(self: *HandlerSet, p: *const HandlerSet) void {
-        self.parent = p;
-    }
-
-    /// Bind a typed perform handler. Compile error if handler
-    /// signature doesn't match E's value and resume types.
-    pub fn onPerform(self: *HandlerSet, comptime E: type, handler: PerformHandlerFn(E), ctx: ?*anyopaque) void {
-        const Gen = struct {
-            fn erased(raw: *const RawEffect, fiber: *EffectFiber, user_ctx: ?*anyopaque) HandlerResult {
-                const val: *E.Value = @ptrCast(@alignCast(raw.value_ptr));
-                var cont = Cont(E){
-                    .fiber = fiber,
-                    .resume_ptr = raw.resume_ptr,
-                };
-                handler(val, &cont, user_ctx);
-                if (cont.delegated) return .skipped;
-                if (cont.alive) {
-                    // Handler returned without resuming, dropping, or delegating.
-                    // Drop the fiber to prevent leaks.
-                    cont.drop();
-                }
-                return .{ .handled = cont.next_effect };
-            }
-        };
-        self.bindings.append(self.allocator, .{
-            .id = effectId(E),
-            .kind = .perform,
-            .handler = Gen.erased,
-            .ctx = ctx,
-        }) catch @panic("OOM");
-    }
-
-    /// Bind a typed emit observer. Compile error if handler
-    /// signature doesn't match E's value type.
-    pub fn onEmit(self: *HandlerSet, comptime E: type, handler: EmitHandlerFn(E), ctx: ?*anyopaque) void {
-        const Gen = struct {
-            fn erased(raw: *const RawEffect, _: *EffectFiber, user_ctx: ?*anyopaque) HandlerResult {
-                const val: *const E.Value = @ptrCast(@alignCast(raw.value_ptr));
-                handler(val, user_ctx);
-                return .{ .handled = null };
-            }
-        };
-        self.bindings.append(self.allocator, .{
-            .id = effectId(E),
-            .kind = .emit,
-            .handler = Gen.erased,
-            .ctx = ctx,
-        }) catch @panic("OOM");
-    }
-};
-
-// ============================================================
-// §7. Runner
-// ============================================================
-
-/// Walk the handler chain (child → parent) looking for a perform handler.
-/// Returns the next effect from the handler that accepted, or resumes with
-/// a zeroed value if the chain is exhausted.
-fn dispatchPerform(eff: *const RawEffect, fiber: *EffectFiber, handlers: *const HandlerSet) ?RawEffect {
-    var level: ?*const HandlerSet = handlers;
-    while (level) |hs| : (level = hs.parent) {
-        for (hs.bindings.items) |binding| {
-            if (binding.kind == .perform and binding.id == eff.id) {
-                switch (binding.handler(eff, fiber, binding.ctx)) {
-                    .handled => |next| return next,
-                    .skipped => {},
-                }
-            }
-        }
-    }
-    // Chain exhausted — no handler accepted. Resume with zeroed value.
-    return fiber.resumeVoid();
-}
-
-/// Walk the entire handler chain, calling ALL matching emit observers at
-/// every level. Child-level observers run first, then parent, then grandparent.
-fn dispatchEmit(eff: *const RawEffect, fiber: *EffectFiber, handlers: *const HandlerSet) void {
-    var level: ?*const HandlerSet = handlers;
-    while (level) |hs| : (level = hs.parent) {
-        for (hs.bindings.items) |binding| {
-            if (binding.kind == .emit and binding.id == eff.id) {
-                _ = binding.handler(eff, fiber, binding.ctx);
-            }
-        }
-    }
-}
-
-pub fn run(fib: *EffectFiber, handlers: *const HandlerSet) void {
-    var maybe_eff = fib.start();
-    while (maybe_eff) |eff| {
-        switch (eff.kind) {
-            .emit => {
-                dispatchEmit(&eff, fib, handlers);
-                maybe_eff = fib.resumeVoid();
-            },
-            .perform => {
-                maybe_eff = dispatchPerform(&eff, fib, handlers);
-            },
-        }
-    }
-}
+pub const run = dispatch_mod.run;
+pub const Scheduler = dispatch_mod.Scheduler;
 
 // ============================================================
 // §8. Tests
@@ -751,4 +459,423 @@ test "auto-drop preserved with delegation in chain" {
     run(&fib, &child);
 
     try testing.expect(!fib.isAlive());
+}
+
+// ============================================================
+// §10. Scheduler tests
+// ============================================================
+
+test "scheduler: effectful handler re-performs effect" {
+    const Lookup = Perform([]const u8, i32);
+
+    var fib = try initFiberDefault(&struct {
+        fn body(ctx: *EffectContext) void {
+            const val = ctx.perform(Lookup, "key");
+            std.debug.assert(val == 42);
+        }
+    }.body);
+    defer fib.deinit();
+
+    // Child: effectful handler that re-performs
+    var child_hs = HandlerSet.init(testing.allocator);
+    defer child_hs.deinit();
+    child_hs.onPerformEffect(Lookup, &struct {
+        fn handle(_: *Lookup.Value, cont: *SchedulerCont(Lookup), ectx: *EffectContext, _: ?*anyopaque) void {
+            const result = ectx.perform(Lookup, "key");
+            cont.@"resume"(result);
+        }
+    }.handle, null);
+
+    // Parent: simple handler returns 42
+    var parent_hs = HandlerSet.init(testing.allocator);
+    defer parent_hs.deinit();
+    parent_hs.onPerform(Lookup, &struct {
+        fn handle(_: *Lookup.Value, cont: *Cont(Lookup), _: ?*anyopaque) void {
+            cont.@"resume"(42);
+        }
+    }.handle, null);
+
+    child_hs.setParent(&parent_hs);
+    var sched = Scheduler.init(testing.allocator);
+    defer sched.deinit();
+    sched.run(&fib, &child_hs);
+
+    try testing.expect(!fib.isAlive());
+}
+
+test "scheduler: pre/post work around re-perform" {
+    const Lookup = Perform([]const u8, i32);
+    const LogEvent = Emit([]const u8);
+
+    const State = struct {
+        log: [4][]const u8 = .{ "", "", "", "" },
+        idx: usize = 0,
+    };
+    var state = State{};
+
+    var fib = try initFiberDefault(&struct {
+        fn body(ctx: *EffectContext) void {
+            const val = ctx.perform(Lookup, "key");
+            std.debug.assert(val == 42);
+        }
+    }.body);
+    defer fib.deinit();
+
+    // Effectful handler: emits before and after re-perform
+    var child_hs = HandlerSet.init(testing.allocator);
+    defer child_hs.deinit();
+    child_hs.onPerformEffect(Lookup, &struct {
+        fn handle(_: *Lookup.Value, cont: *SchedulerCont(Lookup), ectx: *EffectContext, _: ?*anyopaque) void {
+            ectx.emit(LogEvent, "before");
+            const result = ectx.perform(Lookup, "key");
+            ectx.emit(LogEvent, "after");
+            cont.@"resume"(result);
+        }
+    }.handle, null);
+
+    // Parent: handles Lookup and observes LogEvent
+    var parent_hs = HandlerSet.init(testing.allocator);
+    defer parent_hs.deinit();
+    parent_hs.onPerform(Lookup, &struct {
+        fn handle(_: *Lookup.Value, cont: *Cont(Lookup), _: ?*anyopaque) void {
+            cont.@"resume"(42);
+        }
+    }.handle, null);
+    parent_hs.onEmit(LogEvent, &struct {
+        fn handle(val: *const LogEvent.Value, raw_ctx: ?*anyopaque) void {
+            const s: *State = @ptrCast(@alignCast(raw_ctx.?));
+            s.log[s.idx] = val.*;
+            s.idx += 1;
+        }
+    }.handle, @ptrCast(&state));
+
+    child_hs.setParent(&parent_hs);
+    var sched = Scheduler.init(testing.allocator);
+    defer sched.deinit();
+    sched.run(&fib, &child_hs);
+
+    try testing.expectEqual(@as(usize, 2), state.idx);
+    try testing.expectEqualStrings("before", state.log[0]);
+    try testing.expectEqualStrings("after", state.log[1]);
+}
+
+test "scheduler: effectful handler transforms result" {
+    const Lookup = Perform([]const u8, i32);
+
+    var fib = try initFiberDefault(&struct {
+        fn body(ctx: *EffectContext) void {
+            const val = ctx.perform(Lookup, "key");
+            std.debug.assert(val == 84); // parent's 42 doubled
+        }
+    }.body);
+    defer fib.deinit();
+
+    var child_hs = HandlerSet.init(testing.allocator);
+    defer child_hs.deinit();
+    child_hs.onPerformEffect(Lookup, &struct {
+        fn handle(_: *Lookup.Value, cont: *SchedulerCont(Lookup), ectx: *EffectContext, _: ?*anyopaque) void {
+            const result = ectx.perform(Lookup, "key");
+            cont.@"resume"(result * 2);
+        }
+    }.handle, null);
+
+    var parent_hs = HandlerSet.init(testing.allocator);
+    defer parent_hs.deinit();
+    parent_hs.onPerform(Lookup, &struct {
+        fn handle(_: *Lookup.Value, cont: *Cont(Lookup), _: ?*anyopaque) void {
+            cont.@"resume"(42);
+        }
+    }.handle, null);
+
+    child_hs.setParent(&parent_hs);
+    var sched = Scheduler.init(testing.allocator);
+    defer sched.deinit();
+    sched.run(&fib, &child_hs);
+
+    try testing.expect(!fib.isAlive());
+}
+
+test "scheduler: effectful handler drops origin" {
+    const Abort = Perform(void, void);
+
+    var fib = try initFiberDefault(&struct {
+        fn body(ctx: *EffectContext) void {
+            ctx.perform(Abort, {});
+            @panic("unreachable after drop");
+        }
+    }.body);
+    defer fib.deinit();
+
+    var handlers = HandlerSet.init(testing.allocator);
+    defer handlers.deinit();
+    handlers.onPerformEffect(Abort, &struct {
+        fn handle(_: *Abort.Value, cont: *SchedulerCont(Abort), _: *EffectContext, _: ?*anyopaque) void {
+            cont.drop();
+        }
+    }.handle, null);
+
+    var sched = Scheduler.init(testing.allocator);
+    defer sched.deinit();
+    sched.run(&fib, &handlers);
+
+    try testing.expect(!fib.isAlive());
+}
+
+test "scheduler: effectful handler delegates" {
+    const Lookup = Perform([]const u8, i32);
+
+    var fib = try initFiberDefault(&struct {
+        fn body(ctx: *EffectContext) void {
+            const val = ctx.perform(Lookup, "key");
+            std.debug.assert(val == 99);
+        }
+    }.body);
+    defer fib.deinit();
+
+    var child_hs = HandlerSet.init(testing.allocator);
+    defer child_hs.deinit();
+    child_hs.onPerformEffect(Lookup, &struct {
+        fn handle(_: *Lookup.Value, cont: *SchedulerCont(Lookup), _: *EffectContext, _: ?*anyopaque) void {
+            cont.delegate();
+        }
+    }.handle, null);
+
+    var parent_hs = HandlerSet.init(testing.allocator);
+    defer parent_hs.deinit();
+    parent_hs.onPerform(Lookup, &struct {
+        fn handle(_: *Lookup.Value, cont: *Cont(Lookup), _: ?*anyopaque) void {
+            cont.@"resume"(99);
+        }
+    }.handle, null);
+
+    child_hs.setParent(&parent_hs);
+    var sched = Scheduler.init(testing.allocator);
+    defer sched.deinit();
+    sched.run(&fib, &child_hs);
+
+    try testing.expect(!fib.isAlive());
+}
+
+test "scheduler: effectful handler auto-drop" {
+    const Oops = Perform(u8, u8);
+
+    var fib = try initFiberDefault(&struct {
+        fn body(ctx: *EffectContext) void {
+            _ = ctx.perform(Oops, 1);
+            @panic("unreachable after auto-drop");
+        }
+    }.body);
+    defer fib.deinit();
+
+    var handlers = HandlerSet.init(testing.allocator);
+    defer handlers.deinit();
+    handlers.onPerformEffect(Oops, &struct {
+        fn handle(_: *Oops.Value, _: *SchedulerCont(Oops), _: *EffectContext, _: ?*anyopaque) void {
+            // Intentionally do nothing — should auto-drop
+        }
+    }.handle, null);
+
+    var sched = Scheduler.init(testing.allocator);
+    defer sched.deinit();
+    sched.run(&fib, &handlers);
+
+    try testing.expect(!fib.isAlive());
+}
+
+test "scheduler: mixed simple and effectful handlers" {
+    const Lookup = Perform([]const u8, i32);
+
+    var fib = try initFiberDefault(&struct {
+        fn body(ctx: *EffectContext) void {
+            const a = ctx.perform(Lookup, "cached");
+            const b = ctx.perform(Lookup, "miss");
+            std.debug.assert(a == 10);
+            std.debug.assert(b == 84); // 42 * 2
+        }
+    }.body);
+    defer fib.deinit();
+
+    // Child: simple handler — cache hit for "cached", delegate for miss
+    var child_hs = HandlerSet.init(testing.allocator);
+    defer child_hs.deinit();
+    child_hs.onPerform(Lookup, &struct {
+        fn handle(key: *Lookup.Value, cont: *Cont(Lookup), _: ?*anyopaque) void {
+            if (std.mem.eql(u8, key.*, "cached")) {
+                cont.@"resume"(10);
+            } else {
+                cont.delegate();
+            }
+        }
+    }.handle, null);
+
+    // Middle: effectful handler — intercepts, re-performs to parent, doubles result
+    var middle_hs = HandlerSet.init(testing.allocator);
+    defer middle_hs.deinit();
+    middle_hs.onPerformEffect(Lookup, &struct {
+        fn handle(_: *Lookup.Value, cont: *SchedulerCont(Lookup), ectx: *EffectContext, _: ?*anyopaque) void {
+            const result = ectx.perform(Lookup, "key");
+            cont.@"resume"(result * 2);
+        }
+    }.handle, null);
+
+    // Parent: simple handler — always returns 42
+    var parent_hs = HandlerSet.init(testing.allocator);
+    defer parent_hs.deinit();
+    parent_hs.onPerform(Lookup, &struct {
+        fn handle(_: *Lookup.Value, cont: *Cont(Lookup), _: ?*anyopaque) void {
+            cont.@"resume"(42);
+        }
+    }.handle, null);
+
+    child_hs.setParent(&middle_hs);
+    middle_hs.setParent(&parent_hs);
+    var sched = Scheduler.init(testing.allocator);
+    defer sched.deinit();
+    sched.run(&fib, &child_hs);
+
+    try testing.expect(!fib.isAlive());
+}
+
+test "scheduler: nested effectful handlers" {
+    const Lookup = Perform([]const u8, i32);
+
+    var fib = try initFiberDefault(&struct {
+        fn body(ctx: *EffectContext) void {
+            const val = ctx.perform(Lookup, "key");
+            std.debug.assert(val == 52); // inner adds 10 to outer's passthrough of 42
+        }
+    }.body);
+    defer fib.deinit();
+
+    // Inner effectful: re-performs, adds 10
+    var inner_hs = HandlerSet.init(testing.allocator);
+    defer inner_hs.deinit();
+    inner_hs.onPerformEffect(Lookup, &struct {
+        fn handle(_: *Lookup.Value, cont: *SchedulerCont(Lookup), ectx: *EffectContext, _: ?*anyopaque) void {
+            const result = ectx.perform(Lookup, "key");
+            cont.@"resume"(result + 10);
+        }
+    }.handle, null);
+
+    // Outer effectful: re-performs, passes through
+    var outer_hs = HandlerSet.init(testing.allocator);
+    defer outer_hs.deinit();
+    outer_hs.onPerformEffect(Lookup, &struct {
+        fn handle(_: *Lookup.Value, cont: *SchedulerCont(Lookup), ectx: *EffectContext, _: ?*anyopaque) void {
+            const result = ectx.perform(Lookup, "key");
+            cont.@"resume"(result);
+        }
+    }.handle, null);
+
+    // Base: simple handler returns 42
+    var base_hs = HandlerSet.init(testing.allocator);
+    defer base_hs.deinit();
+    base_hs.onPerform(Lookup, &struct {
+        fn handle(_: *Lookup.Value, cont: *Cont(Lookup), _: ?*anyopaque) void {
+            cont.@"resume"(42);
+        }
+    }.handle, null);
+
+    inner_hs.setParent(&outer_hs);
+    outer_hs.setParent(&base_hs);
+    var sched = Scheduler.init(testing.allocator);
+    defer sched.deinit();
+    sched.run(&fib, &inner_hs);
+
+    try testing.expect(!fib.isAlive());
+}
+
+test "scheduler: simple-only handlers match run() behavior" {
+    const Result = Emit(i32);
+
+    const State = struct { sum: i32 = 0 };
+    var state = State{};
+
+    var fib = try initFiberDefault(&struct {
+        fn body(ctx: *EffectContext) void {
+            const a = ctx.perform(GetInt, "first");
+            ctx.emit(Result, a);
+            const b = ctx.perform(GetInt, "second");
+            ctx.emit(Result, b);
+        }
+    }.body);
+    defer fib.deinit();
+
+    var handlers = HandlerSet.init(testing.allocator);
+    defer handlers.deinit();
+
+    handlers.onPerform(GetInt, &struct {
+        fn handle(_: *GetInt.Value, cont: *Cont(GetInt), _: ?*anyopaque) void {
+            cont.@"resume"(42);
+        }
+    }.handle, null);
+
+    handlers.onEmit(Result, &struct {
+        fn handle(val: *const Result.Value, raw_ctx: ?*anyopaque) void {
+            const s: *State = @ptrCast(@alignCast(raw_ctx.?));
+            s.sum += val.*;
+        }
+    }.handle, @ptrCast(&state));
+
+    var sched = Scheduler.init(testing.allocator);
+    defer sched.deinit();
+    sched.run(&fib, &handlers);
+
+    try testing.expectEqual(@as(i32, 84), state.sum);
+}
+
+test "scheduler: effectful handler emits to parent observers" {
+    const Lookup = Perform([]const u8, i32);
+    const Trace = Emit([]const u8);
+
+    const State = struct {
+        log: [4][]const u8 = .{ "", "", "", "" },
+        idx: usize = 0,
+    };
+    var state = State{};
+
+    var fib = try initFiberDefault(&struct {
+        fn body(ctx: *EffectContext) void {
+            const val = ctx.perform(Lookup, "key");
+            std.debug.assert(val == 42);
+        }
+    }.body);
+    defer fib.deinit();
+
+    // Child: effectful handler that emits trace events
+    var child_hs = HandlerSet.init(testing.allocator);
+    defer child_hs.deinit();
+    child_hs.onPerformEffect(Lookup, &struct {
+        fn handle(_: *Lookup.Value, cont: *SchedulerCont(Lookup), ectx: *EffectContext, _: ?*anyopaque) void {
+            ectx.emit(Trace, "handling lookup");
+            const result = ectx.perform(Lookup, "key");
+            ectx.emit(Trace, "got result");
+            cont.@"resume"(result);
+        }
+    }.handle, null);
+
+    // Parent: handles Lookup and observes Trace
+    var parent_hs = HandlerSet.init(testing.allocator);
+    defer parent_hs.deinit();
+    parent_hs.onPerform(Lookup, &struct {
+        fn handle(_: *Lookup.Value, cont: *Cont(Lookup), _: ?*anyopaque) void {
+            cont.@"resume"(42);
+        }
+    }.handle, null);
+    parent_hs.onEmit(Trace, &struct {
+        fn handle(val: *const Trace.Value, raw_ctx: ?*anyopaque) void {
+            const s: *State = @ptrCast(@alignCast(raw_ctx.?));
+            s.log[s.idx] = val.*;
+            s.idx += 1;
+        }
+    }.handle, @ptrCast(&state));
+
+    child_hs.setParent(&parent_hs);
+    var sched = Scheduler.init(testing.allocator);
+    defer sched.deinit();
+    sched.run(&fib, &child_hs);
+
+    try testing.expectEqual(@as(usize, 2), state.idx);
+    try testing.expectEqualStrings("handling lookup", state.log[0]);
+    try testing.expectEqualStrings("got result", state.log[1]);
 }
