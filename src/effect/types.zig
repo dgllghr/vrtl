@@ -23,7 +23,7 @@ pub fn Emit(comptime T: type) type {
 pub const EffectKind = enum(u8) { perform, emit };
 
 pub fn effectId(comptime E: type) usize {
-    return @intFromPtr(&struct { const _: type = E; }._);
+    return @intFromPtr(@typeName(E).ptr);
 }
 
 // ============================================================

@@ -203,14 +203,20 @@ test "auto-drop when handler forgets to resume" {
 
 test "distinct effect types have distinct IDs" {
     const A = Perform(u8, u8);
-    const B = Perform(u8, u8);
+    const B = Perform(u16, u16);
     const C = Emit(u8);
+    const D = Emit(u16);
 
+    // Different type parameters → different effect types → different IDs.
     try testing.expect(effectId(A) != effectId(B));
     try testing.expect(effectId(A) != effectId(C));
     try testing.expect(effectId(B) != effectId(C));
+    try testing.expect(effectId(C) != effectId(D));
     // Same type should produce the same ID.
     try testing.expectEqual(effectId(A), effectId(A));
+    // Perform(u8, u8) is memoized — two bindings yield the same type.
+    const A2 = Perform(u8, u8);
+    try testing.expectEqual(effectId(A), effectId(A2));
 }
 
 test "multiple emit observers for same effect" {

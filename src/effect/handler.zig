@@ -89,7 +89,7 @@ pub const HandlerSet = struct {
 
     /// Bind a typed perform handler. Compile error if handler
     /// signature doesn't match E's value and resume types.
-    pub fn onPerform(self: *HandlerSet, comptime E: type, handler: PerformHandlerFn(E), ctx: ?*anyopaque) void {
+    pub fn onPerform(self: *HandlerSet, comptime E: type, comptime handler: PerformHandlerFn(E), ctx: ?*anyopaque) void {
         const Gen = struct {
             fn erased(raw: *const RawEffect, fiber: *EffectFiber, user_ctx: ?*anyopaque) HandlerResult {
                 const val: *E.Value = @ptrCast(@alignCast(raw.value_ptr));
@@ -117,7 +117,7 @@ pub const HandlerSet = struct {
 
     /// Bind a typed emit observer. Compile error if handler
     /// signature doesn't match E's value type.
-    pub fn onEmit(self: *HandlerSet, comptime E: type, handler: EmitHandlerFn(E), ctx: ?*anyopaque) void {
+    pub fn onEmit(self: *HandlerSet, comptime E: type, comptime handler: EmitHandlerFn(E), ctx: ?*anyopaque) void {
         const Gen = struct {
             fn erased(raw: *const RawEffect, _: *EffectFiber, user_ctx: ?*anyopaque) HandlerResult {
                 const val: *const E.Value = @ptrCast(@alignCast(raw.value_ptr));
@@ -136,7 +136,7 @@ pub const HandlerSet = struct {
     /// Bind an effectful perform handler. The handler runs in its own
     /// fiber and receives an EffectContext to re-perform effects that
     /// propagate to the parent scope.
-    pub fn onPerformEffect(self: *HandlerSet, comptime E: type, handler: EffectfulHandlerFn(E), ctx: ?*anyopaque) void {
+    pub fn onPerformEffect(self: *HandlerSet, comptime E: type, comptime handler: EffectfulHandlerFn(E), ctx: ?*anyopaque) void {
         const Gen = struct {
             fn fiber_body(ectx: *EffectContext) void {
                 const hctx = handler_fiber_ctx_tls;
