@@ -2,9 +2,7 @@
 //
 // FiberIo wraps a std.Io by copying its vtable at runtime and overriding
 // only `await` and `cancel`. When a fiber awaits IO, it yields control
-// to the IoScheduler, which can run other fibers while the IO completes.
-//
-// All gated behind std.Io.VTable availability (Zig 0.16+).
+// to the Scheduler, which can run other fibers while the IO completes.
 
 const std = @import("std");
 const types = @import("effect/types.zig");
@@ -18,15 +16,12 @@ const EffectBodyFn = types.EffectBodyFn;
 const EffectKind = types.EffectKind;
 const HandlerSet = handler_mod.HandlerSet;
 
-const has_std_io = types.has_std_io;
-
-pub const FiberIo = if (has_std_io) FiberIoImpl else struct {};
-pub const IoScheduler = if (has_std_io) IoSchedulerImpl else struct {};
+pub const FiberIo = FiberIoImpl;
+pub const Scheduler = SchedulerImpl;
 
 /// Threadlocal holding the active FiberIo for the currently-executing fiber.
-/// Set by IoScheduler before each resume, read by interceptAwait/interceptCancel.
-pub threadlocal var active_fiber_io: if (has_std_io) ?*FiberIoImpl else void =
-    if (has_std_io) null else {};
+/// Set by Scheduler before each resume, read by interceptAwait/interceptCancel.
+pub threadlocal var active_fiber_io: ?*FiberIoImpl = null;
 
 const FiberIoImpl = struct {
     vtable: std.Io.VTable,
@@ -93,7 +88,6 @@ pub const IoFiberResult = struct {
 /// The fiber is eagerly started to consume threadlocals, so multiple fibers
 /// can be created before running the scheduler.
 pub fn initIoFiber(body: EffectBodyFn, inner_io: std.Io, stack_size: usize) !IoFiberResult {
-    if (!has_std_io) @compileError("initIoFiber requires std.Io.VTable (Zig 0.16+)");
 
     const Static = struct {
         threadlocal var current_body: EffectBodyFn = undefined;
@@ -127,9 +121,11 @@ pub fn initIoFiber(body: EffectBodyFn, inner_io: std.Io, stack_size: usize) !IoF
     return .{ .fiber = fib, .fio = fio };
 }
 
-const IoSchedulerImpl = struct {
+const HandlerFiberCtx = handler_mod.HandlerFiberCtx;
+const initFiberDefault = types.initFiberDefault;
+
+const SchedulerImpl = struct {
     allocator: std.mem.Allocator,
-    inner_io: std.Io,
     // Intrusive doubly-linked list of fiber entries
     head: ?*FiberEntry = null,
     tail: ?*FiberEntry = null,
@@ -144,11 +140,11 @@ const IoSchedulerImpl = struct {
         prev: ?*FiberEntry = null,
     };
 
-    pub fn init(allocator: std.mem.Allocator, inner_io: std.Io) IoSchedulerImpl {
-        return .{ .allocator = allocator, .inner_io = inner_io };
+    pub fn init(allocator: std.mem.Allocator) SchedulerImpl {
+        return .{ .allocator = allocator };
     }
 
-    pub fn deinit(self: *IoSchedulerImpl) void {
+    pub fn deinit(self: *SchedulerImpl) void {
         // Free any remaining entries
         var cur = self.head;
         while (cur) |entry| {
@@ -161,7 +157,7 @@ const IoSchedulerImpl = struct {
         self.count = 0;
     }
 
-    pub fn spawn(self: *IoSchedulerImpl, fiber: *EffectFiber, fio: ?*FiberIoImpl, handlers: *const HandlerSet) !void {
+    pub fn spawn(self: *SchedulerImpl, fiber: *EffectFiber, fio: ?*FiberIoImpl, handlers: *const HandlerSet) !void {
         const entry = try self.allocator.create(FiberEntry);
         entry.* = .{
             .fiber = fiber,
@@ -182,7 +178,7 @@ const IoSchedulerImpl = struct {
         entry.fio = active_fiber_io;
     }
 
-    pub fn run(self: *IoSchedulerImpl) void {
+    pub fn run(self: *SchedulerImpl) void {
         // Start all fibers, capture initial effects.
         // IO fibers created with initIoFiber are already suspended (eagerly
         // started); use resumeVoid for those. Regular fibers use start.
@@ -208,7 +204,7 @@ const IoSchedulerImpl = struct {
                 switch (eff.kind) {
                     .perform => {
                         activateFiber(entry);
-                        entry.pending_effect = dispatch_mod.dispatchPerform(&eff, entry.fiber, entry.handlers);
+                        entry.pending_effect = self.dispatchPerformScheduled(&eff, entry.fiber, entry.handlers);
                         captureFiber(entry);
                         self.pushBack(entry);
                     },
@@ -235,9 +231,87 @@ const IoSchedulerImpl = struct {
         }
     }
 
+    /// Walk the handler chain (child → parent). At each level, try simple
+    /// bindings first, then effectful bindings. Effectful handlers run in
+    /// their own fibers; their effects are dispatched to the parent scope.
+    fn dispatchPerformScheduled(
+        self: *SchedulerImpl,
+        eff: *const RawEffect,
+        origin_fiber: *EffectFiber,
+        handlers: ?*const HandlerSet,
+    ) ?RawEffect {
+        var level: ?*const HandlerSet = handlers;
+        while (level) |hs| : (level = hs.parent) {
+            // Simple bindings (same logic as dispatchPerform)
+            for (hs.bindings.items) |binding| {
+                if (binding.kind == .perform and binding.id == eff.id) {
+                    switch (binding.handler(eff, origin_fiber, binding.ctx)) {
+                        .handled => |next| return next,
+                        .skipped => {},
+                    }
+                }
+            }
+
+            // Effectful bindings
+            for (hs.effectful_bindings.items) |binding| {
+                if (binding.id == eff.id) {
+                    var hctx = HandlerFiberCtx{
+                        .raw = eff,
+                        .user_ctx = binding.ctx,
+                    };
+                    handler_mod.handler_fiber_ctx_tls = &hctx;
+
+                    var hfib = initFiberDefault(binding.fiber_body) catch @panic("OOM");
+                    defer hfib.deinit();
+
+                    // Run handler fiber — dispatch ITS effects to parent scope
+                    var heff = hfib.start();
+                    while (heff) |h| {
+                        switch (h.kind) {
+                            .emit => {
+                                if (hs.parent) |p| {
+                                    dispatch_mod.dispatchEmit(&h, &hfib, p);
+                                }
+                                heff = hfib.resumeVoid();
+                            },
+                            .perform => {
+                                heff = self.dispatchPerformScheduled(&h, &hfib, hs.parent);
+                            },
+                            .io_wait => {
+                                // Handler fiber awaiting IO — resume it
+                                // so the interceptor calls original_await.
+                                activateFiber: {
+                                    // No FiberEntry for handler fibers — they
+                                    // inherit the active_fiber_io from their
+                                    // parent context, so just resume directly.
+                                    break :activateFiber;
+                                }
+                                heff = hfib.resumeVoid();
+                            },
+                        }
+                    }
+
+                    // Handler fiber completed — check outcome
+                    if (hctx.delegated) continue;
+                    if (hctx.resumed) return origin_fiber.resumeVoid();
+                    if (hctx.dropped) {
+                        origin_fiber.deinit();
+                        return null;
+                    }
+                    // auto-drop (shouldn't happen — wrapper sets dropped)
+                    origin_fiber.deinit();
+                    return null;
+                }
+            }
+        }
+
+        // Chain exhausted — no handler accepted. Resume with zeroed value.
+        return origin_fiber.resumeVoid();
+    }
+
     // -- Intrusive linked list operations --
 
-    fn pushBack(self: *IoSchedulerImpl, entry: *FiberEntry) void {
+    fn pushBack(self: *SchedulerImpl, entry: *FiberEntry) void {
         entry.next = null;
         entry.prev = self.tail;
         if (self.tail) |t| {
@@ -249,7 +323,7 @@ const IoSchedulerImpl = struct {
         self.count += 1;
     }
 
-    fn popFront(self: *IoSchedulerImpl) void {
+    fn popFront(self: *SchedulerImpl) void {
         const entry = self.head orelse return;
         self.head = entry.next;
         if (self.head) |h| {
@@ -270,7 +344,6 @@ const IoSchedulerImpl = struct {
 const testing = std.testing;
 
 test "FiberIo: single fiber yields on await then completes" {
-    if (!has_std_io) return;
 
     // Track whether our mock await was called
     const State = struct {
@@ -311,7 +384,7 @@ test "FiberIo: single fiber yields on await then completes" {
         }
     }.handle, @ptrCast(&result_val));
 
-    var sched = IoSchedulerImpl.init(testing.allocator, mock_io);
+    var sched = SchedulerImpl.init(testing.allocator);
     defer sched.deinit();
     try sched.spawn(&res.fiber, res.fio, &handlers);
     sched.run();
@@ -322,7 +395,6 @@ test "FiberIo: single fiber yields on await then completes" {
 }
 
 test "IoScheduler: two fibers round-robin" {
-    if (!has_std_io) return;
 
     const State = struct {
         var order: [8]u8 = .{0} ** 8;
@@ -370,7 +442,7 @@ test "IoScheduler: two fibers round-robin" {
         }
     }.handle, null);
 
-    var sched = IoSchedulerImpl.init(testing.allocator, mock_io);
+    var sched = SchedulerImpl.init(testing.allocator);
     defer sched.deinit();
     try sched.spawn(&res1.fiber, res1.fio, &handlers);
     try sched.spawn(&res2.fiber, res2.fio, &handlers);
@@ -390,7 +462,6 @@ test "IoScheduler: two fibers round-robin" {
 }
 
 test "IoScheduler: IO combined with algebraic effects" {
-    if (!has_std_io) return;
 
     var mock_vt = makeNoopVtable();
     mock_vt.await = &struct {
@@ -434,7 +505,7 @@ test "IoScheduler: IO combined with algebraic effects" {
         }
     }.handle, null);
 
-    var sched = IoSchedulerImpl.init(testing.allocator, mock_io);
+    var sched = SchedulerImpl.init(testing.allocator);
     defer sched.deinit();
     try sched.spawn(&res.fiber, res.fio, &handlers);
     sched.run();
@@ -455,8 +526,6 @@ pub const DummyFuture = struct { _padding: u8 = 0 };
 /// Build a VTable where every field is a no-op/panic stub.
 /// We only need `await` and `cancel` to be real; the rest are never called in tests.
 pub fn makeNoopVtable() std.Io.VTable {
-    if (!has_std_io) unreachable;
-
     var vt: std.Io.VTable = undefined;
     // Zero-fill: all function pointers become well-defined (will segfault if
     // called, but our tests only call await/cancel).

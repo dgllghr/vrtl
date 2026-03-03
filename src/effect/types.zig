@@ -70,18 +70,15 @@ pub fn initFiberDefault(body: EffectBodyFn) !EffectFiber {
 // §4. EffectContext — used inside effectful fiber bodies
 // ============================================================
 
-pub const has_std_io = @hasDecl(std.Io, "VTable");
-
 pub const EffectContext = struct {
     handle: *EffectFiber.Handle,
-    io: if (has_std_io) std.Io else void = if (has_std_io) .{ .userdata = null, .vtable = undefined } else {},
+    io: std.Io = .{ .userdata = null, .vtable = undefined },
 
     pub fn init(handle: *EffectFiber.Handle) EffectContext {
         return .{ .handle = handle };
     }
 
     pub fn initWithIo(handle: *EffectFiber.Handle, io_instance: std.Io) EffectContext {
-        if (!has_std_io) return .{ .handle = handle };
         return .{ .handle = handle, .io = io_instance };
     }
 

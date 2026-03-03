@@ -30,10 +30,8 @@ pub const HandlerSet = effect.HandlerSet;
 pub const run = effect.run;
 pub const Scheduler = effect.Scheduler;
 
-// IO scheduling (Zig 0.16+ with std.Io.VTable)
-pub const has_std_io = effect.has_std_io;
+// IO scheduling
 pub const FiberIo = effect.FiberIo;
-pub const IoScheduler = effect.IoScheduler;
 pub const IoFiberResult = effect.IoFiberResult;
 pub const initIoFiber = effect.initIoFiber;
 
@@ -66,9 +64,7 @@ test {
 // Integration: nested fibers with multi-file IO
 // ============================================================
 
-test "IoScheduler: nested handler chain with multi-file IO across fibers" {
-    if (!has_std_io) return;
-
+test "Scheduler: nested handler chain with multi-file IO across fibers" {
     const std = @import("std");
     const io_mod = @import("io.zig");
     const testing = std.testing;
@@ -195,7 +191,7 @@ test "IoScheduler: nested handler chain with multi-file IO across fibers" {
     inner.setParent(&outer);
 
     // -- Run --
-    var sched = IoScheduler.init(testing.allocator, mock_io);
+    var sched = Scheduler.init(testing.allocator);
     defer sched.deinit();
     try sched.spawn(&res_a.fiber, res_a.fio, &inner);
     try sched.spawn(&res_b.fiber, res_b.fio, &inner);

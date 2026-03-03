@@ -36,13 +36,11 @@ pub const EffectfulHandlerFn = handler_mod.EffectfulHandlerFn;
 pub const HandlerSet = handler_mod.HandlerSet;
 
 pub const run = dispatch_mod.run;
-pub const Scheduler = dispatch_mod.Scheduler;
 
-// IO scheduling (Zig 0.16+ with std.Io.VTable)
+// IO scheduling
 const io_mod = @import("io.zig");
-pub const has_std_io = types.has_std_io;
 pub const FiberIo = io_mod.FiberIo;
-pub const IoScheduler = io_mod.IoScheduler;
+pub const Scheduler = io_mod.Scheduler;
 pub const IoFiberResult = io_mod.IoFiberResult;
 pub const initIoFiber = io_mod.initIoFiber;
 
@@ -512,7 +510,8 @@ test "scheduler: effectful handler re-performs effect" {
     child_hs.setParent(&parent_hs);
     var sched = Scheduler.init(testing.allocator);
     defer sched.deinit();
-    sched.run(&fib, &child_hs);
+    try sched.spawn(&fib, null, &child_hs);
+    sched.run();
 
     try testing.expect(!fib.isAlive());
 }
@@ -566,7 +565,8 @@ test "scheduler: pre/post work around re-perform" {
     child_hs.setParent(&parent_hs);
     var sched = Scheduler.init(testing.allocator);
     defer sched.deinit();
-    sched.run(&fib, &child_hs);
+    try sched.spawn(&fib, null, &child_hs);
+    sched.run();
 
     try testing.expectEqual(@as(usize, 2), state.idx);
     try testing.expectEqualStrings("before", state.log[0]);
@@ -604,7 +604,8 @@ test "scheduler: effectful handler transforms result" {
     child_hs.setParent(&parent_hs);
     var sched = Scheduler.init(testing.allocator);
     defer sched.deinit();
-    sched.run(&fib, &child_hs);
+    try sched.spawn(&fib, null, &child_hs);
+    sched.run();
 
     try testing.expect(!fib.isAlive());
 }
@@ -630,7 +631,8 @@ test "scheduler: effectful handler drops origin" {
 
     var sched = Scheduler.init(testing.allocator);
     defer sched.deinit();
-    sched.run(&fib, &handlers);
+    try sched.spawn(&fib, null, &handlers);
+    sched.run();
 
     try testing.expect(!fib.isAlive());
 }
@@ -665,7 +667,8 @@ test "scheduler: effectful handler delegates" {
     child_hs.setParent(&parent_hs);
     var sched = Scheduler.init(testing.allocator);
     defer sched.deinit();
-    sched.run(&fib, &child_hs);
+    try sched.spawn(&fib, null, &child_hs);
+    sched.run();
 
     try testing.expect(!fib.isAlive());
 }
@@ -691,7 +694,8 @@ test "scheduler: effectful handler auto-drop" {
 
     var sched = Scheduler.init(testing.allocator);
     defer sched.deinit();
-    sched.run(&fib, &handlers);
+    try sched.spawn(&fib, null, &handlers);
+    sched.run();
 
     try testing.expect(!fib.isAlive());
 }
@@ -745,7 +749,8 @@ test "scheduler: mixed simple and effectful handlers" {
     middle_hs.setParent(&parent_hs);
     var sched = Scheduler.init(testing.allocator);
     defer sched.deinit();
-    sched.run(&fib, &child_hs);
+    try sched.spawn(&fib, null, &child_hs);
+    sched.run();
 
     try testing.expect(!fib.isAlive());
 }
@@ -794,7 +799,8 @@ test "scheduler: nested effectful handlers" {
     outer_hs.setParent(&base_hs);
     var sched = Scheduler.init(testing.allocator);
     defer sched.deinit();
-    sched.run(&fib, &inner_hs);
+    try sched.spawn(&fib, null, &inner_hs);
+    sched.run();
 
     try testing.expect(!fib.isAlive());
 }
@@ -833,7 +839,8 @@ test "scheduler: simple-only handlers match run() behavior" {
 
     var sched = Scheduler.init(testing.allocator);
     defer sched.deinit();
-    sched.run(&fib, &handlers);
+    try sched.spawn(&fib, null, &handlers);
+    sched.run();
 
     try testing.expectEqual(@as(i32, 84), state.sum);
 }
@@ -887,7 +894,8 @@ test "scheduler: effectful handler emits to parent observers" {
     child_hs.setParent(&parent_hs);
     var sched = Scheduler.init(testing.allocator);
     defer sched.deinit();
-    sched.run(&fib, &child_hs);
+    try sched.spawn(&fib, null, &child_hs);
+    sched.run();
 
     try testing.expectEqual(@as(usize, 2), state.idx);
     try testing.expectEqualStrings("handling lookup", state.log[0]);
