@@ -57,7 +57,7 @@ pub fn Fiber(comptime YieldT: type, comptime ResumeT: type) type {
         /// Create a fiber that will run `body`.
         pub fn init(body: BodyFn, stack_size: usize) !Self {
             const Wrapper = struct {
-                fn entry(co: ?*coro.Coro) callconv(.C) void {
+                fn entry(co: ?*coro.Coro) callconv(.c) void {
                     const c = co orelse @panic("null coro");
                     const body_ptr: *const BodyFn = @ptrCast(@alignCast(
                         coro.getUserData(c) orelse @panic("no user_data")));

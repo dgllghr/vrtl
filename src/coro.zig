@@ -25,7 +25,8 @@ pub const CoroError = error{
     GenericError,
     InvalidPointer,
     InvalidCoroutine,
-    InvalidStatus,
+    NotSuspended,
+    NotRunning,
     MakeContextError,
     SwitchContextError,
     NotEnoughSpace,
@@ -41,7 +42,8 @@ fn mapResult(res: Result) CoroError!void {
         c.MCO_GENERIC_ERROR => CoroError.GenericError,
         c.MCO_INVALID_POINTER => CoroError.InvalidPointer,
         c.MCO_INVALID_COROUTINE => CoroError.InvalidCoroutine,
-        c.MCO_INVALID_STATUS => CoroError.InvalidStatus,
+        c.MCO_NOT_SUSPENDED => CoroError.NotSuspended,
+        c.MCO_NOT_RUNNING => CoroError.NotRunning,
         c.MCO_MAKE_CONTEXT_ERROR => CoroError.MakeContextError,
         c.MCO_SWITCH_CONTEXT_ERROR => CoroError.SwitchContextError,
         c.MCO_NOT_ENOUGH_SPACE => CoroError.NotEnoughSpace,
@@ -54,7 +56,7 @@ fn mapResult(res: Result) CoroError!void {
 }
 
 /// Initialize a coroutine descriptor with a callback function.
-pub fn descInit(func: *const fn (?*Coro) callconv(.C) void, stack_size: usize) Desc {
+pub fn descInit(func: *const fn (?*Coro) callconv(.c) void, stack_size: usize) Desc {
     const desc = c.mco_desc_init(func, stack_size);
     return desc;
 }
