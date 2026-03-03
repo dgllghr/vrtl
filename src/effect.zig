@@ -39,10 +39,8 @@ pub const run = dispatch_mod.run;
 
 // IO scheduling
 const io_mod = @import("io.zig");
-pub const FiberIo = io_mod.FiberIo;
 pub const Scheduler = io_mod.Scheduler;
 pub const IoFiberResult = io_mod.IoFiberResult;
-pub const initIoFiber = io_mod.initIoFiber;
 
 // ============================================================
 // §8. Tests

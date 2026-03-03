@@ -31,9 +31,7 @@ pub const run = effect.run;
 pub const Scheduler = effect.Scheduler;
 
 // IO scheduling
-pub const FiberIo = effect.FiberIo;
 pub const IoFiberResult = effect.IoFiberResult;
-pub const initIoFiber = effect.initIoFiber;
 
 // Continuations (used in handler signatures)
 pub const Cont = effect.Cont;
@@ -66,7 +64,6 @@ test {
 
 test "Scheduler: nested handler chain with multi-file IO across fibers" {
     const std = @import("std");
-    const io_mod = @import("io.zig");
     const testing = std.testing;
 
     // -- Effects --
@@ -98,6 +95,7 @@ test "Scheduler: nested handler chain with multi-file IO across fibers" {
 
     // -- Mock IO backend --
     // The mock await callback bumps a counter (simulating completed IO).
+    const io_mod = @import("io.zig");
     var mock_vt = io_mod.makeNoopVtable();
     mock_vt.await = &struct {
         fn mock_await(_: ?*anyopaque, _: *std.Io.AnyFuture, _: []u8, _: std.mem.Alignment) void {
@@ -106,9 +104,13 @@ test "Scheduler: nested handler chain with multi-file IO across fibers" {
     }.mock_await;
     const mock_io = std.Io{ .userdata = null, .vtable = &mock_vt };
 
+    // -- Scheduler (must exist before creating IO fibers) --
+    var sched = Scheduler.init(testing.allocator);
+    defer sched.deinit();
+
     // -- Fibers --
     // Fiber A: reads "config.json", writes it, reads "schema.json", writes it.
-    var res_a = try initIoFiber(&struct {
+    var res_a = try sched.createIoFiber(&struct {
         fn body(ctx: *EffectContext) void {
             const cfg = ctx.perform(ReadFile, "config.json");
             _ = cfg; // contents received from handler
@@ -127,7 +129,7 @@ test "Scheduler: nested handler chain with multi-file IO across fibers" {
     defer res_a.fiber.deinit();
 
     // Fiber B: reads "data.csv", writes it, reads "report.txt", writes it.
-    var res_b = try initIoFiber(&struct {
+    var res_b = try sched.createIoFiber(&struct {
         fn body(ctx: *EffectContext) void {
             const data = ctx.perform(ReadFile, "data.csv");
             _ = data;
@@ -147,9 +149,9 @@ test "Scheduler: nested handler chain with multi-file IO across fibers" {
 
     // -- Nested handler chain --
     //
-    //   inner (child):  observes FileWritten → records to log
+    //   inner (child):  observes FileWritten -> records to log
     //                   delegates ReadFile to parent
-    //   outer (parent): handles ReadFile → returns mock contents
+    //   outer (parent): handles ReadFile -> returns mock contents
 
     var inner = HandlerSet.init(testing.allocator);
     defer inner.deinit();
@@ -191,10 +193,8 @@ test "Scheduler: nested handler chain with multi-file IO across fibers" {
     inner.setParent(&outer);
 
     // -- Run --
-    var sched = Scheduler.init(testing.allocator);
-    defer sched.deinit();
-    try sched.spawn(&res_a.fiber, res_a.fio, &inner);
-    try sched.spawn(&res_b.fiber, res_b.fio, &inner);
+    try sched.spawn(&res_a.fiber, res_a.handle, &inner);
+    try sched.spawn(&res_b.fiber, res_b.handle, &inner);
     sched.run();
 
     // -- Assertions --
