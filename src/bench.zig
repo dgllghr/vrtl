@@ -4,7 +4,8 @@ const types = @import("effect/types.zig");
 const handler_mod = @import("effect/handler.zig");
 const dispatch_mod = @import("effect/dispatch.zig");
 const cont_mod = @import("effect/cont.zig");
-const io_mod = @import("io.zig");
+const sched_mod = @import("scheduler.zig");
+const pool_mod = @import("pool.zig");
 
 const EffectFiber = types.EffectFiber;
 const EffectContext = types.EffectContext;
@@ -31,6 +32,7 @@ pub fn main() void {
     p("{s}\n", .{"-" ** 78});
 
     bench(p, "fiber create/destroy", 100_000, benchFiberCreateDestroy);
+    bench(p, "fiber create/destroy (pooled)", 100_000, benchFiberCreateDestroyPooled);
     bench(p, "yield/resume round-trips", 1_000_000, benchYieldResume);
     bench(p, "emit dispatch", 1_000_000, benchEmitDispatch);
     bench(p, "perform dispatch", 1_000_000, benchPerformDispatch);
@@ -59,6 +61,23 @@ fn benchFiberCreateDestroy(iters: usize) u64 {
     const start = clockNs();
     for (0..iters) |_| {
         var f = types.initFiberDefault(&struct {
+            fn body(_: *EffectContext) void {}
+        }.body) catch @panic("init");
+        f.deinit();
+    }
+    return clockNs() - start;
+}
+
+// ============================================================
+// 1b. Fiber create/destroy (pooled)
+// ============================================================
+
+fn benchFiberCreateDestroyPooled(iters: usize) u64 {
+    var pool = pool_mod.StackPool{};
+    defer pool.deinit();
+    const start = clockNs();
+    for (0..iters) |_| {
+        var f = types.initFiberPooled(&pool, &struct {
             fn body(_: *EffectContext) void {}
         }.body) catch @panic("init");
         f.deinit();
@@ -172,9 +191,12 @@ fn benchScheduler(iters: usize) u64 {
     const N = 10;
     const M = 1000;
 
+    var mock_vt = sched_mod.makeNoopVtable();
+    const mock_io = std.Io{ .userdata = null, .vtable = &mock_vt };
+
     const start = clockNs();
     for (0..iters) |_| {
-        var sched = io_mod.Scheduler.init(allocator);
+        var sched = sched_mod.Scheduler.init(allocator);
 
         var handlers = HandlerSet.init(allocator);
         handlers.onPerform(BenchPerform, &struct {
@@ -183,23 +205,23 @@ fn benchScheduler(iters: usize) u64 {
             }
         }.handle, null);
 
-        var fibers: [N]EffectFiber = undefined;
+        var results: [N]sched_mod.FiberResult = undefined;
         for (0..N) |i| {
-            fibers[i] = types.initFiberDefault(&struct {
+            results[i] = sched.createFiber(&struct {
                 fn body(ctx: *EffectContext) void {
                     for (0..M) |j| {
                         const r = ctx.perform(BenchPerform, j);
                         std.mem.doNotOptimizeAway(r);
                     }
                 }
-            }.body) catch @panic("init");
-            sched.spawn(&fibers[i], null, &handlers) catch @panic("spawn");
+            }.body, mock_io, 0) catch @panic("init");
+            sched.spawn(&results[i].fiber, results[i].handle, &handlers) catch @panic("spawn");
         }
 
         sched.run();
 
         for (0..N) |i| {
-            fibers[i].deinit();
+            results[i].fiber.deinit();
         }
         handlers.deinit();
         sched.deinit();

@@ -66,6 +66,22 @@ pub fn initFiberDefault(body: EffectBodyFn) !EffectFiber {
     return initFiber(body, 0);
 }
 
+/// Create an effect fiber using a StackPool for allocation.
+pub fn initFiberPooled(pool: *@import("../pool.zig").StackPool, body: EffectBodyFn) !EffectFiber {
+    const Static = struct {
+        threadlocal var current_body: EffectBodyFn = undefined;
+    };
+    Static.current_body = body;
+
+    return EffectFiber.initPooled(&struct {
+        fn wrapper(h: *EffectFiber.Handle) void {
+            const b = Static.current_body;
+            var ctx = EffectContext.init(h);
+            b(&ctx);
+        }
+    }.wrapper, 0, pool);
+}
+
 // ============================================================
 // §4. EffectContext — used inside effectful fiber bodies
 // ============================================================

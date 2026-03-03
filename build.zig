@@ -183,6 +183,12 @@ pub fn build(b: *std.Build) void {
 
     const run_bench = b.addRunArtifact(bench_exe);
     run_bench.step.dependOn(b.getInstallStep());
+
+    const ocaml_bench = b.addSystemCommand(&.{
+        "opam", "exec", "--", "dune", "exec", "--root", "ocaml", "./bench.exe",
+    });
+    ocaml_bench.step.dependOn(&run_bench.step);
+
     const bench_step = b.step("bench", "Run benchmarks");
-    bench_step.dependOn(&run_bench.step);
+    bench_step.dependOn(&ocaml_bench.step);
 }

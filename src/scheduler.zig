@@ -16,8 +16,6 @@ const EffectBodyFn = types.EffectBodyFn;
 const EffectKind = types.EffectKind;
 const HandlerSet = handler_mod.HandlerSet;
 
-pub const Scheduler = SchedulerImpl;
-
 const AwaitFn = fn (?*anyopaque, *std.Io.AnyFuture, []u8, std.mem.Alignment) void;
 const CancelFn = fn (?*anyopaque, *std.Io.AnyFuture, []u8, std.mem.Alignment) void;
 
@@ -40,22 +38,23 @@ fn interceptCancel(userdata: ?*anyopaque, future: *std.Io.AnyFuture, result_buf:
     original_cancel_fn(userdata, future, result_buf, alignment);
 }
 
-/// Result of createIoFiber — bundles the fiber with its handle pointer.
-pub const IoFiberResult = struct {
+/// Result of createFiber — bundles the fiber with its handle pointer.
+pub const FiberResult = struct {
     fiber: EffectFiber,
     handle: *EffectFiber.Handle,
 };
 
 const HandlerFiberCtx = handler_mod.HandlerFiberCtx;
-const initFiberDefault = types.initFiberDefault;
+const initFiberPooled = types.initFiberPooled;
 
-const SchedulerImpl = struct {
+pub const Scheduler = struct {
     allocator: std.mem.Allocator,
     // Intrusive doubly-linked list of fiber entries
     head: ?*FiberEntry = null,
     tail: ?*FiberEntry = null,
     count: usize = 0,
     io_state: ?IoState = null,
+    pool: @import("pool.zig").StackPool = .{},
 
     const IoState = struct {
         vtable: std.Io.VTable,
@@ -77,11 +76,12 @@ const SchedulerImpl = struct {
         prev: ?*FiberEntry = null,
     };
 
-    pub fn init(allocator: std.mem.Allocator) SchedulerImpl {
+    pub fn init(allocator: std.mem.Allocator) Scheduler {
         return .{ .allocator = allocator };
     }
 
-    pub fn deinit(self: *SchedulerImpl) void {
+    pub fn deinit(self: *Scheduler) void {
+        self.pool.deinit();
         // Free any remaining entries
         var cur = self.head;
         while (cur) |entry| {
@@ -94,7 +94,7 @@ const SchedulerImpl = struct {
         self.count = 0;
     }
 
-    pub fn spawn(self: *SchedulerImpl, fiber: *EffectFiber, handle: ?*EffectFiber.Handle, handlers: *const HandlerSet) !void {
+    pub fn spawn(self: *Scheduler, fiber: *EffectFiber, handle: ?*EffectFiber.Handle, handlers: *const HandlerSet) !void {
         const entry = try self.allocator.create(FiberEntry);
         entry.* = .{
             .fiber = fiber,
@@ -105,7 +105,7 @@ const SchedulerImpl = struct {
         self.pushBack(entry);
     }
 
-    fn setupIo(self: *SchedulerImpl, inner: std.Io) void {
+    fn setupIo(self: *Scheduler, inner: std.Io) void {
         var vt = inner.vtable.*;
         const orig_await = vt.await;
         const orig_cancel = vt.cancel;
@@ -119,7 +119,7 @@ const SchedulerImpl = struct {
         };
     }
 
-    pub fn createIoFiber(self: *SchedulerImpl, body: EffectBodyFn, inner_io: std.Io, stack_size: usize) !IoFiberResult {
+    pub fn createFiber(self: *Scheduler, body: EffectBodyFn, inner_io: std.Io, stack_size: usize) !FiberResult {
         if (self.io_state == null) {
             self.setupIo(inner_io);
         }
@@ -131,7 +131,7 @@ const SchedulerImpl = struct {
         Static.current_body = body;
         Static.current_io = self.io_state.?.wrappedIo();
 
-        var fib = try EffectFiber.init(&struct {
+        var fib = try EffectFiber.initPooled(&struct {
             fn wrapper(h: *EffectFiber.Handle) void {
                 const b = Static.current_body;
                 const io = Static.current_io;
@@ -142,15 +142,15 @@ const SchedulerImpl = struct {
                 _ = h.yield(.{ .kind = .io_wait });
                 b(&ctx);
             }
-        }.wrapper, stack_size);
+        }.wrapper, stack_size, &self.pool);
 
         // Eagerly start the fiber so the wrapper runs up to the initial yield,
         // consuming the threadlocals. The fiber is now suspended.
         _ = fib.start();
 
         // Capture the handle set by the wrapper before it's overwritten
-        // by the next createIoFiber call.
-        const handle = active_fiber_handle orelse @panic("createIoFiber: wrapper did not set active_fiber_handle");
+        // by the next createFiber call.
+        const handle = active_fiber_handle orelse @panic("createFiber: wrapper did not set active_fiber_handle");
 
         return .{ .fiber = fib, .handle = handle };
     }
@@ -165,7 +165,7 @@ const SchedulerImpl = struct {
         entry.handle = active_fiber_handle;
     }
 
-    pub fn run(self: *SchedulerImpl) void {
+    pub fn run(self: *Scheduler) void {
         // Set original function pointers from io_state (once, before the loop).
         if (self.io_state) |*ios| {
             original_await_fn = ios.original_await;
@@ -173,7 +173,7 @@ const SchedulerImpl = struct {
         }
 
         // Start all fibers, capture initial effects.
-        // IO fibers created with createIoFiber are already suspended (eagerly
+        // IO fibers created with createFiber are already suspended (eagerly
         // started); use resumeVoid for those. Regular fibers use start.
         {
             var cur = self.head;
@@ -228,7 +228,7 @@ const SchedulerImpl = struct {
     /// bindings first, then effectful bindings. Effectful handlers run in
     /// their own fibers; their effects are dispatched to the parent scope.
     fn dispatchPerformScheduled(
-        self: *SchedulerImpl,
+        self: *Scheduler,
         eff: *const RawEffect,
         origin_fiber: *EffectFiber,
         handlers: ?*const HandlerSet,
@@ -254,7 +254,7 @@ const SchedulerImpl = struct {
                     };
                     handler_mod.handler_fiber_ctx_tls = &hctx;
 
-                    var hfib = initFiberDefault(binding.fiber_body) catch @panic("OOM");
+                    var hfib = initFiberPooled(&self.pool, binding.fiber_body) catch @panic("OOM");
                     defer hfib.deinit();
 
                     // Run handler fiber — dispatch ITS effects to parent scope
@@ -294,7 +294,7 @@ const SchedulerImpl = struct {
 
     // -- Intrusive linked list operations --
 
-    fn pushBack(self: *SchedulerImpl, entry: *FiberEntry) void {
+    fn pushBack(self: *Scheduler, entry: *FiberEntry) void {
         entry.next = null;
         entry.prev = self.tail;
         if (self.tail) |t| {
@@ -306,7 +306,7 @@ const SchedulerImpl = struct {
         self.count += 1;
     }
 
-    fn popFront(self: *SchedulerImpl) void {
+    fn popFront(self: *Scheduler) void {
         const entry = self.head orelse return;
         self.head = entry.next;
         if (self.head) |h| {
@@ -326,7 +326,7 @@ const SchedulerImpl = struct {
 
 const testing = std.testing;
 
-test "IoScheduler: single fiber yields on await then completes" {
+test "Scheduler: single fiber yields on await then completes" {
 
     // Track whether our mock await was called
     const State = struct {
@@ -348,10 +348,10 @@ test "IoScheduler: single fiber yields on await then completes" {
 
     var result_val: usize = 0;
 
-    var sched = SchedulerImpl.init(testing.allocator);
+    var sched = Scheduler.init(testing.allocator);
     defer sched.deinit();
 
-    var res = try sched.createIoFiber(&struct {
+    var res = try sched.createFiber(&struct {
         fn body(ctx: *EffectContext) void {
             // Simulate an IO await by calling await through the io interface
             var dummy_future: DummyFuture = .{};
@@ -378,7 +378,7 @@ test "IoScheduler: single fiber yields on await then completes" {
     try testing.expect(!res.fiber.isAlive());
 }
 
-test "IoScheduler: two fibers round-robin" {
+test "Scheduler: two fibers round-robin" {
 
     const State = struct {
         var order: [8]u8 = .{0} ** 8;
@@ -396,10 +396,10 @@ test "IoScheduler: two fibers round-robin" {
 
     const Trace = types.Emit(u8);
 
-    var sched = SchedulerImpl.init(testing.allocator);
+    var sched = Scheduler.init(testing.allocator);
     defer sched.deinit();
 
-    var res1 = try sched.createIoFiber(&struct {
+    var res1 = try sched.createFiber(&struct {
         fn body(ctx: *EffectContext) void {
             ctx.emit(Trace, 'A');
             // Trigger an IO await to yield
@@ -410,7 +410,7 @@ test "IoScheduler: two fibers round-robin" {
     }.body, mock_io, 0);
     defer res1.fiber.deinit();
 
-    var res2 = try sched.createIoFiber(&struct {
+    var res2 = try sched.createFiber(&struct {
         fn body(ctx: *EffectContext) void {
             ctx.emit(Trace, '1');
             var dummy: DummyFuture = .{};
@@ -446,7 +446,7 @@ test "IoScheduler: two fibers round-robin" {
     try testing.expectEqual(@as(u8, '2'), trace[3]);
 }
 
-test "IoScheduler: IO combined with algebraic effects" {
+test "Scheduler: IO combined with algebraic effects" {
 
     var mock_vt = makeNoopVtable();
     mock_vt.await = &struct {
@@ -462,10 +462,10 @@ test "IoScheduler: IO combined with algebraic effects" {
     };
     State.result = 0;
 
-    var sched = SchedulerImpl.init(testing.allocator);
+    var sched = Scheduler.init(testing.allocator);
     defer sched.deinit();
 
-    var res = try sched.createIoFiber(&struct {
+    var res = try sched.createFiber(&struct {
         fn body(ctx: *EffectContext) void {
             // Perform an algebraic effect
             const val = ctx.perform(GetVal, {});

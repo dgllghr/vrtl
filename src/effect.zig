@@ -37,10 +37,10 @@ pub const HandlerSet = handler_mod.HandlerSet;
 
 pub const run = dispatch_mod.run;
 
-// IO scheduling
-const io_mod = @import("io.zig");
-pub const Scheduler = io_mod.Scheduler;
-pub const IoFiberResult = io_mod.IoFiberResult;
+// Scheduling
+const sched_mod = @import("scheduler.zig");
+pub const Scheduler = sched_mod.Scheduler;
+pub const FiberResult = sched_mod.FiberResult;
 
 // ============================================================
 // §8. Tests

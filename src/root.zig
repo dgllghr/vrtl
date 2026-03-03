@@ -31,7 +31,7 @@ pub const run = effect.run;
 pub const Scheduler = effect.Scheduler;
 
 // IO scheduling
-pub const IoFiberResult = effect.IoFiberResult;
+pub const FiberResult = effect.FiberResult;
 
 // Continuations (used in handler signatures)
 pub const Cont = effect.Cont;
@@ -55,7 +55,8 @@ pub const fiber = @import("fiber.zig");
 test {
     _ = @import("effect.zig");
     _ = @import("fiber.zig");
-    _ = @import("io.zig");
+    _ = @import("scheduler.zig");
+    _ = @import("pool.zig");
 }
 
 // ============================================================
@@ -95,8 +96,8 @@ test "Scheduler: nested handler chain with multi-file IO across fibers" {
 
     // -- Mock IO backend --
     // The mock await callback bumps a counter (simulating completed IO).
-    const io_mod = @import("io.zig");
-    var mock_vt = io_mod.makeNoopVtable();
+    const sched_mod = @import("scheduler.zig");
+    var mock_vt = sched_mod.makeNoopVtable();
     mock_vt.await = &struct {
         fn mock_await(_: ?*anyopaque, _: *std.Io.AnyFuture, _: []u8, _: std.mem.Alignment) void {
             S.await_count += 1;
@@ -110,12 +111,12 @@ test "Scheduler: nested handler chain with multi-file IO across fibers" {
 
     // -- Fibers --
     // Fiber A: reads "config.json", writes it, reads "schema.json", writes it.
-    var res_a = try sched.createIoFiber(&struct {
+    var res_a = try sched.createFiber(&struct {
         fn body(ctx: *EffectContext) void {
             const cfg = ctx.perform(ReadFile, "config.json");
             _ = cfg; // contents received from handler
             S.record("A:write(config.json)");
-            var dummy: io_mod.DummyFuture = .{};
+            var dummy: sched_mod.DummyFuture = .{};
             ctx.io.vtable.await(ctx.io.userdata, @ptrCast(&dummy), &.{}, .@"1");
             ctx.emit(FileWritten, "config.json");
 
@@ -129,12 +130,12 @@ test "Scheduler: nested handler chain with multi-file IO across fibers" {
     defer res_a.fiber.deinit();
 
     // Fiber B: reads "data.csv", writes it, reads "report.txt", writes it.
-    var res_b = try sched.createIoFiber(&struct {
+    var res_b = try sched.createFiber(&struct {
         fn body(ctx: *EffectContext) void {
             const data = ctx.perform(ReadFile, "data.csv");
             _ = data;
             S.record("B:write(data.csv)");
-            var dummy: io_mod.DummyFuture = .{};
+            var dummy: sched_mod.DummyFuture = .{};
             ctx.io.vtable.await(ctx.io.userdata, @ptrCast(&dummy), &.{}, .@"1");
             ctx.emit(FileWritten, "data.csv");
 

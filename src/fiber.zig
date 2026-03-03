@@ -54,29 +54,38 @@ pub fn Fiber(comptime YieldT: type, comptime ResumeT: type) type {
             }
         };
 
+        const Wrapper = struct {
+            fn entry(co: ?*coro.Coro) callconv(.c) void {
+                const c = co orelse @panic("null coro");
+                const body_ptr: *const BodyFn = @ptrCast(@alignCast(
+                    coro.getUserData(c) orelse @panic("no user_data")));
+                var handle = Handle{ .co = c };
+                body_ptr.*(&handle);
+            }
+        };
+
+        // Threadlocal slot so the body fn pointer outlives the
+        // init stack frame. Works for comptime-known function
+        // pointers; runtime closures would need a heap allocation.
+        const Static = struct {
+            threadlocal var current_body: BodyFn = undefined;
+        };
+
         /// Create a fiber that will run `body`.
         pub fn init(body: BodyFn, stack_size: usize) !Self {
-            const Wrapper = struct {
-                fn entry(co: ?*coro.Coro) callconv(.c) void {
-                    const c = co orelse @panic("null coro");
-                    const body_ptr: *const BodyFn = @ptrCast(@alignCast(
-                        coro.getUserData(c) orelse @panic("no user_data")));
-                    var handle = Handle{ .co = c };
-                    body_ptr.*(&handle);
-                }
-            };
-
             var desc = coro.descInit(Wrapper.entry, stack_size);
-
-            // Store the body fn pointer in a threadlocal so it outlives
-            // this stack frame. This works for comptime-known function
-            // pointers; runtime closures would need a heap allocation.
-            const Static = struct {
-                threadlocal var current_body: BodyFn = undefined;
-            };
             Static.current_body = body;
             coro.setUserData(&desc, @ptrCast(&Static.current_body));
+            const co = try coro.create(&desc);
+            return Self{ .co = co };
+        }
 
+        /// Create a fiber using `pool` for stack allocation.
+        pub fn initPooled(body: BodyFn, stack_size: usize, pool: *@import("pool.zig").StackPool) !Self {
+            var desc = coro.descInit(Wrapper.entry, stack_size);
+            Static.current_body = body;
+            coro.setUserData(&desc, @ptrCast(&Static.current_body));
+            pool.patchDesc(&desc);
             const co = try coro.create(&desc);
             return Self{ .co = co };
         }
