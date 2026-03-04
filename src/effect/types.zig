@@ -34,7 +34,6 @@ pub const RawEffect = struct {
     id: usize = 0,
     kind: EffectKind,
     value_ptr: *anyopaque = undefined,
-    value_size: usize = 0,
     /// For perform: pointer to the resume slot on the performer's
     /// stack frame. The continuation writes the resume value here.
     resume_ptr: ?*anyopaque = null,
@@ -107,7 +106,6 @@ pub const EffectContext = struct {
             .id = effectId(E),
             .kind = .perform,
             .value_ptr = @ptrCast(&storage),
-            .value_size = @sizeOf(E.Value),
             .resume_ptr = if (@sizeOf(E.Resume) > 0) @ptrCast(&result) else null,
         });
         return result;
@@ -122,7 +120,6 @@ pub const EffectContext = struct {
             .id = effectId(E),
             .kind = .emit,
             .value_ptr = @ptrCast(&storage),
-            .value_size = @sizeOf(E.Value),
         });
     }
 };

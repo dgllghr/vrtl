@@ -4,9 +4,8 @@
 //   - The fiber yields values of type Y
 //   - The fiber receives values of type R when resumed
 //
-// Data passes through minicoro's storage (mco_push/mco_pop),
-// which lives on the coroutine's stack — no heap allocation
-// for the transfer itself.
+// Non-zero-size yield/resume values are passed via threadlocal
+// pointers — no memcpy through minicoro's storage buffer.
 
 const std = @import("std");
 const coro = @import("coro.zig");
@@ -36,21 +35,38 @@ pub fn Fiber(comptime YieldT: type, comptime ResumeT: type) type {
         /// Receives a handle to yield values and receive resume values.
         pub const BodyFn = *const fn (*Handle) void;
 
+        // Threadlocal slots for passing yield/resume values as pointers.
+        // The source value lives on the yielding/resuming stack frame,
+        // which is frozen during the context switch, so the pointer is
+        // valid until the next resume/yield.
+        const Slots = struct {
+            threadlocal var yield_ptr: *const YieldT = undefined;
+            threadlocal var resume_ptr: *const ResumeT = undefined;
+        };
+
         /// Handle passed to the fiber body. Provides yield().
         pub const Handle = struct {
             co: *coro.Coro,
 
             /// Yield a value and suspend. Returns the value passed to resume().
             pub fn yield(self: *Handle, value: YieldT) ResumeT {
-                pushTyped(self.co, YieldT, value);
+                if (comptime @sizeOf(YieldT) > 0) {
+                    Slots.yield_ptr = &value;
+                }
                 coro.yield(self.co) catch @panic("yield failed");
-                return popTyped(self.co, ResumeT);
+                if (comptime @sizeOf(ResumeT) > 0) {
+                    return Slots.resume_ptr.*;
+                }
+                return undefined;
             }
 
             /// Yield without a value (for Fiber(void, R)).
             pub fn yieldVoid(self: *Handle) ResumeT {
                 coro.yield(self.co) catch @panic("yield failed");
-                return popTyped(self.co, ResumeT);
+                if (comptime @sizeOf(ResumeT) > 0) {
+                    return Slots.resume_ptr.*;
+                }
+                return undefined;
             }
         };
 
@@ -117,7 +133,9 @@ pub fn Fiber(comptime YieldT: type, comptime ResumeT: type) type {
 
         /// Start with an initial value (for Fiber(Y, R) where R != void).
         pub fn startWith(self: *Self, value: ResumeT) ?YieldT {
-            pushTyped(self.co, ResumeT, value);
+            if (comptime @sizeOf(ResumeT) > 0) {
+                Slots.resume_ptr = &value;
+            }
             self.state = .running;
             coro.@"resume"(self.co) catch {
                 self.state = .dead;
@@ -130,7 +148,9 @@ pub fn Fiber(comptime YieldT: type, comptime ResumeT: type) type {
         /// Returns the next yielded value, or null if the fiber completed.
         pub fn @"resume"(self: *Self, value: ResumeT) ?YieldT {
             if (self.state != .suspended) return null;
-            pushTyped(self.co, ResumeT, value);
+            if (comptime @sizeOf(ResumeT) > 0) {
+                Slots.resume_ptr = &value;
+            }
             self.state = .running;
             coro.@"resume"(self.co) catch {
                 self.state = .dead;
@@ -164,7 +184,10 @@ pub fn Fiber(comptime YieldT: type, comptime ResumeT: type) type {
             const s = coro.status(self.co);
             if (s == coro.c.MCO_SUSPENDED) {
                 self.state = .suspended;
-                return popTyped(self.co, YieldT);
+                if (comptime @sizeOf(YieldT) > 0) {
+                    return Slots.yield_ptr.*;
+                }
+                return @as(YieldT, undefined);
             } else {
                 self.state = .dead;
                 return null;
@@ -174,25 +197,7 @@ pub fn Fiber(comptime YieldT: type, comptime ResumeT: type) type {
 }
 
 // ============================================================
-// §2. Typed push/pop via minicoro storage
-// ============================================================
-
-fn pushTyped(co: *coro.Coro, comptime T: type, value: T) void {
-    if (@sizeOf(T) == 0) return; // void, zero-size types
-    const bytes = std.mem.asBytes(&value);
-    coro.push(co, bytes) catch @panic("push failed: not enough space");
-}
-
-fn popTyped(co: *coro.Coro, comptime T: type) T {
-    if (@sizeOf(T) == 0) return undefined;
-    var value: T = undefined;
-    const buf = std.mem.asBytes(&value);
-    coro.pop(co, buf) catch @panic("pop failed: not enough data");
-    return value;
-}
-
-// ============================================================
-// §3. Convenience aliases
+// §2. Convenience aliases
 // ============================================================
 
 /// A fiber that yields values of type T and doesn't receive resume values.

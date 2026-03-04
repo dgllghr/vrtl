@@ -236,8 +236,8 @@ pub const Scheduler = struct {
         var level: ?*const HandlerSet = handlers;
         while (level) |hs| : (level = hs.parent) {
             // Simple bindings (same logic as dispatchPerform)
-            for (hs.bindings.items) |binding| {
-                if (binding.kind == .perform and binding.id == eff.id) {
+            for (hs.perform_bindings.items) |binding| {
+                if (binding.id == eff.id) {
                     switch (binding.handler(eff, origin_fiber, binding.ctx)) {
                         .handled => |next| return next,
                         .skipped => {},

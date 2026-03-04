@@ -37,17 +37,23 @@ pub fn EffectfulHandlerFn(comptime E: type) type {
 // §6. HandlerSet — type-safe binding, type-erased storage
 // ============================================================
 
-const HandlerResult = union(enum) {
+pub const PerformResult = union(enum) {
     handled: ?RawEffect,
     skipped,
 };
 
-const ErasedHandlerFn = *const fn (raw: *const RawEffect, fiber: *EffectFiber, ctx: ?*anyopaque) HandlerResult;
+const ErasedPerformFn = *const fn (raw: *const RawEffect, fiber: *EffectFiber, ctx: ?*anyopaque) PerformResult;
+const ErasedEmitFn = *const fn (raw: *const RawEffect, ctx: ?*anyopaque) void;
 
-const Binding = struct {
+const PerformBinding = struct {
     id: usize,
-    kind: EffectKind,
-    handler: ErasedHandlerFn,
+    handler: ErasedPerformFn,
+    ctx: ?*anyopaque,
+};
+
+const EmitBinding = struct {
+    id: usize,
+    handler: ErasedEmitFn,
     ctx: ?*anyopaque,
 };
 
@@ -69,17 +75,19 @@ const EffectfulBinding = struct {
 };
 
 pub const HandlerSet = struct {
-    bindings: std.ArrayListUnmanaged(Binding),
-    effectful_bindings: std.ArrayListUnmanaged(EffectfulBinding),
+    perform_bindings: std.ArrayListUnmanaged(PerformBinding) = .{},
+    emit_bindings: std.ArrayListUnmanaged(EmitBinding) = .{},
+    effectful_bindings: std.ArrayListUnmanaged(EffectfulBinding) = .{},
     allocator: std.mem.Allocator,
     parent: ?*const HandlerSet = null,
 
     pub fn init(allocator: std.mem.Allocator) HandlerSet {
-        return .{ .bindings = .{}, .effectful_bindings = .{}, .allocator = allocator };
+        return .{ .allocator = allocator };
     }
 
     pub fn deinit(self: *HandlerSet) void {
-        self.bindings.deinit(self.allocator);
+        self.perform_bindings.deinit(self.allocator);
+        self.emit_bindings.deinit(self.allocator);
         self.effectful_bindings.deinit(self.allocator);
     }
 
@@ -91,7 +99,7 @@ pub const HandlerSet = struct {
     /// signature doesn't match E's value and resume types.
     pub fn onPerform(self: *HandlerSet, comptime E: type, comptime handler: PerformHandlerFn(E), ctx: ?*anyopaque) void {
         const Gen = struct {
-            fn erased(raw: *const RawEffect, fiber: *EffectFiber, user_ctx: ?*anyopaque) HandlerResult {
+            fn erased(raw: *const RawEffect, fiber: *EffectFiber, user_ctx: ?*anyopaque) PerformResult {
                 const val: *E.Value = @ptrCast(@alignCast(raw.value_ptr));
                 var cont = Cont(E){
                     .fiber = fiber,
@@ -107,9 +115,8 @@ pub const HandlerSet = struct {
                 return .{ .handled = cont.next_effect };
             }
         };
-        self.bindings.append(self.allocator, .{
+        self.perform_bindings.append(self.allocator, .{
             .id = effectId(E),
-            .kind = .perform,
             .handler = Gen.erased,
             .ctx = ctx,
         }) catch @panic("OOM");
@@ -119,15 +126,13 @@ pub const HandlerSet = struct {
     /// signature doesn't match E's value type.
     pub fn onEmit(self: *HandlerSet, comptime E: type, comptime handler: EmitHandlerFn(E), ctx: ?*anyopaque) void {
         const Gen = struct {
-            fn erased(raw: *const RawEffect, _: *EffectFiber, user_ctx: ?*anyopaque) HandlerResult {
+            fn erased(raw: *const RawEffect, user_ctx: ?*anyopaque) void {
                 const val: *const E.Value = @ptrCast(@alignCast(raw.value_ptr));
                 handler(val, user_ctx);
-                return .{ .handled = null };
             }
         };
-        self.bindings.append(self.allocator, .{
+        self.emit_bindings.append(self.allocator, .{
             .id = effectId(E),
-            .kind = .emit,
             .handler = Gen.erased,
             .ctx = ctx,
         }) catch @panic("OOM");
