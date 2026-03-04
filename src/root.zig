@@ -53,6 +53,7 @@ pub const effectId = effect.effectId;
 pub const fiber = @import("fiber.zig");
 
 test {
+    _ = @import("deque.zig");
     _ = @import("effect.zig");
     _ = @import("fiber.zig");
     _ = @import("scheduler.zig");
@@ -106,7 +107,7 @@ test "Scheduler: nested handler chain with multi-file IO across fibers" {
     const mock_io = std.Io{ .userdata = null, .vtable = &mock_vt };
 
     // -- Scheduler (must exist before creating IO fibers) --
-    var sched = Scheduler.init(testing.allocator);
+    var sched = try Scheduler.init(testing.allocator);
     defer sched.deinit();
 
     // -- Fibers --

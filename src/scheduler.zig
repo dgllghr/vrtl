@@ -8,6 +8,7 @@ const std = @import("std");
 const types = @import("effect/types.zig");
 const dispatch_mod = @import("effect/dispatch.zig");
 const handler_mod = @import("effect/handler.zig");
+const Deque = @import("deque.zig").WorkStealingDeque;
 
 const RawEffect = types.RawEffect;
 const EffectFiber = types.EffectFiber;
@@ -49,10 +50,7 @@ const initFiberPooled = types.initFiberPooled;
 
 pub const Scheduler = struct {
     allocator: std.mem.Allocator,
-    // Intrusive doubly-linked list of fiber entries
-    head: ?*FiberEntry = null,
-    tail: ?*FiberEntry = null,
-    count: usize = 0,
+    deque: Deque(*FiberEntry),
     io_state: ?IoState = null,
     pool: @import("pool.zig").StackPool = .{},
 
@@ -72,26 +70,18 @@ pub const Scheduler = struct {
         handlers: *const HandlerSet,
         handle: ?*EffectFiber.Handle,
         pending_effect: ?RawEffect,
-        next: ?*FiberEntry = null,
-        prev: ?*FiberEntry = null,
     };
 
-    pub fn init(allocator: std.mem.Allocator) Scheduler {
-        return .{ .allocator = allocator };
+    pub fn init(allocator: std.mem.Allocator) !Scheduler {
+        return .{ .allocator = allocator, .deque = try Deque(*FiberEntry).init(allocator, 16) };
     }
 
     pub fn deinit(self: *Scheduler) void {
         self.pool.deinit();
-        // Free any remaining entries
-        var cur = self.head;
-        while (cur) |entry| {
-            const next = entry.next;
+        while (self.deque.pop()) |entry| {
             self.allocator.destroy(entry);
-            cur = next;
         }
-        self.head = null;
-        self.tail = null;
-        self.count = 0;
+        self.deque.deinit();
     }
 
     pub fn spawn(self: *Scheduler, fiber: *EffectFiber, handle: ?*EffectFiber.Handle, handlers: *const HandlerSet) !void {
@@ -102,7 +92,7 @@ pub const Scheduler = struct {
             .handle = handle,
             .pending_effect = null,
         };
-        self.pushBack(entry);
+        try self.deque.push(entry);
     }
 
     fn setupIo(self: *Scheduler, inner: std.Io) void {
@@ -173,11 +163,15 @@ pub const Scheduler = struct {
         }
 
         // Start all fibers, capture initial effects.
-        // IO fibers created with createFiber are already suspended (eagerly
-        // started); use resumeVoid for those. Regular fibers use start.
+        // The deque doesn't support iteration, so we drain via steal (FIFO),
+        // start each fiber, and push it back. Runs once before the main loop.
         {
-            var cur = self.head;
-            while (cur) |entry| {
+            const n = self.deque.len();
+            for (0..n) |_| {
+                const entry = switch (self.deque.steal()) {
+                    .success => |e| e,
+                    else => break,
+                };
                 if (entry.fiber.isSuspended()) {
                     activateFiber(entry);
                     entry.pending_effect = entry.fiber.resumeVoid();
@@ -185,40 +179,36 @@ pub const Scheduler = struct {
                     entry.pending_effect = entry.fiber.start();
                 }
                 captureFiber(entry);
-                cur = entry.next;
+                self.deque.push(entry) catch unreachable;
             }
         }
 
-        // Round-robin loop
-        while (self.head) |entry| {
-            self.popFront();
-
+        // Work-stealing loop (LIFO pop for cache locality).
+        while (self.deque.pop()) |entry| {
             if (entry.pending_effect) |eff| {
                 switch (eff.kind) {
                     .perform => {
                         activateFiber(entry);
                         entry.pending_effect = self.dispatchPerformScheduled(&eff, entry.fiber, entry.handlers);
                         captureFiber(entry);
-                        self.pushBack(entry);
+                        self.deque.push(entry) catch unreachable;
                     },
                     .emit => {
                         dispatch_mod.dispatchEmit(&eff, entry.fiber, entry.handlers);
                         activateFiber(entry);
                         entry.pending_effect = entry.fiber.resumeVoid();
                         captureFiber(entry);
-                        self.pushBack(entry);
+                        self.deque.push(entry) catch unreachable;
                     },
                     .io_wait => {
-                        // The fiber yielded because it called await on IO.
-                        // Resume it so the interceptor calls original_await.
                         activateFiber(entry);
                         entry.pending_effect = entry.fiber.resumeVoid();
                         captureFiber(entry);
-                        self.pushBack(entry);
+                        self.deque.push(entry) catch unreachable;
                     },
                 }
             } else {
-                // Fiber is dead — remove from queue
+                // Fiber is dead — free the entry
                 self.allocator.destroy(entry);
             }
         }
@@ -292,32 +282,6 @@ pub const Scheduler = struct {
         return origin_fiber.resumeVoid();
     }
 
-    // -- Intrusive linked list operations --
-
-    fn pushBack(self: *Scheduler, entry: *FiberEntry) void {
-        entry.next = null;
-        entry.prev = self.tail;
-        if (self.tail) |t| {
-            t.next = entry;
-        } else {
-            self.head = entry;
-        }
-        self.tail = entry;
-        self.count += 1;
-    }
-
-    fn popFront(self: *Scheduler) void {
-        const entry = self.head orelse return;
-        self.head = entry.next;
-        if (self.head) |h| {
-            h.prev = null;
-        } else {
-            self.tail = null;
-        }
-        entry.next = null;
-        entry.prev = null;
-        self.count -= 1;
-    }
 };
 
 // ============================================================
@@ -348,7 +312,7 @@ test "Scheduler: single fiber yields on await then completes" {
 
     var result_val: usize = 0;
 
-    var sched = Scheduler.init(testing.allocator);
+    var sched = try Scheduler.init(testing.allocator);
     defer sched.deinit();
 
     var res = try sched.createFiber(&struct {
@@ -378,7 +342,7 @@ test "Scheduler: single fiber yields on await then completes" {
     try testing.expect(!res.fiber.isAlive());
 }
 
-test "Scheduler: two fibers round-robin" {
+test "Scheduler: two fibers LIFO depth-first" {
 
     const State = struct {
         var order: [8]u8 = .{0} ** 8;
@@ -396,7 +360,7 @@ test "Scheduler: two fibers round-robin" {
 
     const Trace = types.Emit(u8);
 
-    var sched = Scheduler.init(testing.allocator);
+    var sched = try Scheduler.init(testing.allocator);
     defer sched.deinit();
 
     var res1 = try sched.createFiber(&struct {
@@ -437,13 +401,14 @@ test "Scheduler: two fibers round-robin" {
     try testing.expect(!res1.fiber.isAlive());
     try testing.expect(!res2.fiber.isAlive());
 
-    // Verify interleaving: A, 1, then (after both yield on io_wait) B, 2
+    // LIFO: last-spawned fiber (res2) runs depth-first to completion,
+    // then res1 runs. Within each fiber, order is preserved.
     const trace = State.order[0..State.idx];
     try testing.expectEqual(@as(usize, 4), trace.len);
-    try testing.expectEqual(@as(u8, 'A'), trace[0]);
-    try testing.expectEqual(@as(u8, '1'), trace[1]);
-    try testing.expectEqual(@as(u8, 'B'), trace[2]);
-    try testing.expectEqual(@as(u8, '2'), trace[3]);
+    try testing.expectEqual(@as(u8, '1'), trace[0]);
+    try testing.expectEqual(@as(u8, '2'), trace[1]);
+    try testing.expectEqual(@as(u8, 'A'), trace[2]);
+    try testing.expectEqual(@as(u8, 'B'), trace[3]);
 }
 
 test "Scheduler: IO combined with algebraic effects" {
@@ -462,7 +427,7 @@ test "Scheduler: IO combined with algebraic effects" {
     };
     State.result = 0;
 
-    var sched = Scheduler.init(testing.allocator);
+    var sched = try Scheduler.init(testing.allocator);
     defer sched.deinit();
 
     var res = try sched.createFiber(&struct {

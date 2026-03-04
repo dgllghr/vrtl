@@ -196,7 +196,7 @@ fn benchScheduler(iters: usize) u64 {
 
     const start = clockNs();
     for (0..iters) |_| {
-        var sched = sched_mod.Scheduler.init(allocator);
+        var sched = sched_mod.Scheduler.init(allocator) catch @panic("OOM");
 
         var handlers = HandlerSet.init(allocator);
         handlers.onPerform(BenchPerform, &struct {

@@ -506,7 +506,7 @@ test "scheduler: effectful handler re-performs effect" {
     }.handle, null);
 
     child_hs.setParent(&parent_hs);
-    var sched = Scheduler.init(testing.allocator);
+    var sched = try Scheduler.init(testing.allocator);
     defer sched.deinit();
     try sched.spawn(&fib, null, &child_hs);
     sched.run();
@@ -561,7 +561,7 @@ test "scheduler: pre/post work around re-perform" {
     }.handle, @ptrCast(&state));
 
     child_hs.setParent(&parent_hs);
-    var sched = Scheduler.init(testing.allocator);
+    var sched = try Scheduler.init(testing.allocator);
     defer sched.deinit();
     try sched.spawn(&fib, null, &child_hs);
     sched.run();
@@ -600,7 +600,7 @@ test "scheduler: effectful handler transforms result" {
     }.handle, null);
 
     child_hs.setParent(&parent_hs);
-    var sched = Scheduler.init(testing.allocator);
+    var sched = try Scheduler.init(testing.allocator);
     defer sched.deinit();
     try sched.spawn(&fib, null, &child_hs);
     sched.run();
@@ -627,7 +627,7 @@ test "scheduler: effectful handler drops origin" {
         }
     }.handle, null);
 
-    var sched = Scheduler.init(testing.allocator);
+    var sched = try Scheduler.init(testing.allocator);
     defer sched.deinit();
     try sched.spawn(&fib, null, &handlers);
     sched.run();
@@ -663,7 +663,7 @@ test "scheduler: effectful handler delegates" {
     }.handle, null);
 
     child_hs.setParent(&parent_hs);
-    var sched = Scheduler.init(testing.allocator);
+    var sched = try Scheduler.init(testing.allocator);
     defer sched.deinit();
     try sched.spawn(&fib, null, &child_hs);
     sched.run();
@@ -690,7 +690,7 @@ test "scheduler: effectful handler auto-drop" {
         }
     }.handle, null);
 
-    var sched = Scheduler.init(testing.allocator);
+    var sched = try Scheduler.init(testing.allocator);
     defer sched.deinit();
     try sched.spawn(&fib, null, &handlers);
     sched.run();
@@ -745,7 +745,7 @@ test "scheduler: mixed simple and effectful handlers" {
 
     child_hs.setParent(&middle_hs);
     middle_hs.setParent(&parent_hs);
-    var sched = Scheduler.init(testing.allocator);
+    var sched = try Scheduler.init(testing.allocator);
     defer sched.deinit();
     try sched.spawn(&fib, null, &child_hs);
     sched.run();
@@ -795,7 +795,7 @@ test "scheduler: nested effectful handlers" {
 
     inner_hs.setParent(&outer_hs);
     outer_hs.setParent(&base_hs);
-    var sched = Scheduler.init(testing.allocator);
+    var sched = try Scheduler.init(testing.allocator);
     defer sched.deinit();
     try sched.spawn(&fib, null, &inner_hs);
     sched.run();
@@ -835,7 +835,7 @@ test "scheduler: simple-only handlers match run() behavior" {
         }
     }.handle, @ptrCast(&state));
 
-    var sched = Scheduler.init(testing.allocator);
+    var sched = try Scheduler.init(testing.allocator);
     defer sched.deinit();
     try sched.spawn(&fib, null, &handlers);
     sched.run();
@@ -890,7 +890,7 @@ test "scheduler: effectful handler emits to parent observers" {
     }.handle, @ptrCast(&state));
 
     child_hs.setParent(&parent_hs);
-    var sched = Scheduler.init(testing.allocator);
+    var sched = try Scheduler.init(testing.allocator);
     defer sched.deinit();
     try sched.spawn(&fib, null, &child_hs);
     sched.run();
