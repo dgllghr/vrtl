@@ -1,14 +1,15 @@
-// Cooperative IO scheduling for effect fibers.
+// Multicore work-stealing scheduler for effect fibers.
 //
-// The Scheduler owns a single IO vtable copy (IoState). When a fiber
-// awaits IO, the interceptor yields control to the Scheduler, which
-// can run other fibers while the IO completes.
+// N worker threads, each with its own deque + stack pool.
+// Idle workers steal from peers. Worker 0 runs on the caller thread.
 
 const std = @import("std");
 const types = @import("effect/types.zig");
 const dispatch_mod = @import("effect/dispatch.zig");
 const handler_mod = @import("effect/handler.zig");
 const Deque = @import("deque.zig").WorkStealingDeque;
+const StackPool = @import("pool.zig").StackPool;
+const darwin = std.c;
 
 const RawEffect = types.RawEffect;
 const EffectFiber = types.EffectFiber;
@@ -21,10 +22,10 @@ const AwaitFn = fn (?*anyopaque, *std.Io.AnyFuture, []u8, std.mem.Alignment) voi
 const CancelFn = fn (?*anyopaque, *std.Io.AnyFuture, []u8, std.mem.Alignment) void;
 
 /// Threadlocal holding the active fiber handle for the currently-executing fiber.
-/// Set by Scheduler before each resume, read by interceptAwait.
+/// Set by Worker before each resume, read by interceptAwait.
 pub threadlocal var active_fiber_handle: ?*EffectFiber.Handle = null;
 
-/// Original await/cancel function pointers, set once per run() call from IoState.
+/// Original await/cancel function pointers, set once per worker thread from IoState.
 threadlocal var original_await_fn: *const AwaitFn = undefined;
 threadlocal var original_cancel_fn: *const CancelFn = undefined;
 
@@ -48,104 +49,82 @@ pub const FiberResult = struct {
 const HandlerFiberCtx = handler_mod.HandlerFiberCtx;
 const initFiberPooled = types.initFiberPooled;
 
-pub const Scheduler = struct {
-    allocator: std.mem.Allocator,
-    deque: Deque(*FiberEntry),
-    io_state: ?IoState = null,
-    pool: @import("pool.zig").StackPool = .{},
+// ============================================================
+// Futex helpers (macOS __ulock)
+// ============================================================
 
-    const IoState = struct {
-        vtable: std.Io.VTable,
-        userdata: ?*anyopaque,
-        original_await: *const AwaitFn,
-        original_cancel: *const CancelFn,
+const PARK_RUNNING: u32 = 0;
+const PARK_PARKED: u32 = 1;
+const PARK_NOTIFIED: u32 = 2;
 
-        fn wrappedIo(self: *IoState) std.Io {
-            return .{ .userdata = self.userdata, .vtable = &self.vtable };
-        }
-    };
+fn futexWait(ptr: *u32, expected: u32) void {
+    _ = darwin.__ulock_wait(
+        .{ .op = .COMPARE_AND_WAIT },
+        @ptrCast(ptr),
+        @as(u64, expected),
+        0, // infinite timeout
+    );
+}
 
-    const FiberEntry = struct {
-        fiber: *EffectFiber,
-        handlers: *const HandlerSet,
-        handle: ?*EffectFiber.Handle,
-        pending_effect: ?RawEffect,
-    };
+fn futexWakeOne(ptr: *u32) void {
+    _ = darwin.__ulock_wake(
+        .{ .op = .COMPARE_AND_WAIT },
+        @ptrCast(ptr),
+        0,
+    );
+}
 
-    pub fn init(allocator: std.mem.Allocator) !Scheduler {
-        return .{ .allocator = allocator, .deque = try Deque(*FiberEntry).init(allocator, 16) };
+fn futexWakeAll(ptr: *u32) void {
+    _ = darwin.__ulock_wake(
+        .{ .op = .COMPARE_AND_WAIT, .WAKE_ALL = true },
+        @ptrCast(ptr),
+        0,
+    );
+}
+
+// ============================================================
+// Worker
+// ============================================================
+
+pub const Worker = struct {
+    deque: Deque(*Scheduler.FiberEntry),
+    pool: StackPool = .{},
+    thread: ?std.Thread = null,
+    id: u32,
+    parent: *Scheduler,
+    rng_state: u32,
+    park_state: u32 = PARK_RUNNING,
+
+    fn initWorker(alloc: std.mem.Allocator, id: u32, parent: *Scheduler) !Worker {
+        return .{
+            .deque = try Deque(*Scheduler.FiberEntry).init(alloc, 16),
+            .id = id,
+            .parent = parent,
+            .rng_state = id +| 1,
+        };
     }
 
-    pub fn deinit(self: *Scheduler) void {
+    fn deinitWorker(self: *Worker) void {
         self.pool.deinit();
         while (self.deque.pop()) |entry| {
-            self.allocator.destroy(entry);
+            self.parent.allocator.destroy(entry);
         }
         self.deque.deinit();
     }
 
-    pub fn spawn(self: *Scheduler, fiber: *EffectFiber, handle: ?*EffectFiber.Handle, handlers: *const HandlerSet) !void {
-        const entry = try self.allocator.create(FiberEntry);
-        entry.* = .{
-            .fiber = fiber,
-            .handlers = handlers,
-            .handle = handle,
-            .pending_effect = null,
-        };
-        try self.deque.push(entry);
-    }
-
-    fn setupIo(self: *Scheduler, inner: std.Io) void {
-        var vt = inner.vtable.*;
-        const orig_await = vt.await;
-        const orig_cancel = vt.cancel;
-        vt.await = &interceptAwait;
-        vt.cancel = &interceptCancel;
-        self.io_state = .{
-            .vtable = vt,
-            .userdata = inner.userdata,
-            .original_await = orig_await,
-            .original_cancel = orig_cancel,
-        };
-    }
-
-    pub fn createFiber(self: *Scheduler, body: EffectBodyFn, inner_io: std.Io, stack_size: usize) !FiberResult {
-        if (self.io_state == null) {
-            self.setupIo(inner_io);
-        }
-
-        const Static = struct {
-            threadlocal var current_body: EffectBodyFn = undefined;
-            threadlocal var current_io: std.Io = undefined;
-        };
-        Static.current_body = body;
-        Static.current_io = self.io_state.?.wrappedIo();
-
-        var fib = try EffectFiber.initPooled(&struct {
-            fn wrapper(h: *EffectFiber.Handle) void {
-                const b = Static.current_body;
-                const io = Static.current_io;
-                active_fiber_handle = h;
-                var ctx = EffectContext.initWithIo(h, io);
-                // Yield immediately to consume threadlocals before caller creates next fiber.
-                // The scheduler's run() will resume us past this point.
-                _ = h.yield(.{ .kind = .io_wait });
-                b(&ctx);
-            }
-        }.wrapper, stack_size, &self.pool);
-
-        // Eagerly start the fiber so the wrapper runs up to the initial yield,
-        // consuming the threadlocals. The fiber is now suspended.
-        _ = fib.start();
-
-        // Capture the handle set by the wrapper before it's overwritten
-        // by the next createFiber call.
-        const handle = active_fiber_handle orelse @panic("createFiber: wrapper did not set active_fiber_handle");
-
-        return .{ .fiber = fib, .handle = handle };
+    /// xorshift32 PRNG for steal target selection.
+    fn nextRand(self: *Worker) u32 {
+        var x = self.rng_state;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        self.rng_state = x;
+        return x;
     }
 
     /// Restore the threadlocal before resuming a fiber.
+    const FiberEntry = Scheduler.FiberEntry;
+
     fn activateFiber(entry: *FiberEntry) void {
         active_fiber_handle = entry.handle;
     }
@@ -155,16 +134,98 @@ pub const Scheduler = struct {
         entry.handle = active_fiber_handle;
     }
 
-    pub fn run(self: *Scheduler) void {
-        // Set original function pointers from io_state (once, before the loop).
-        if (self.io_state) |*ios| {
+    /// Process a single fiber entry — dispatch its pending effect.
+    fn processEntry(self: *Worker, entry: *FiberEntry) void {
+        const sched = self.parent;
+        if (entry.pending_effect) |eff| {
+            switch (eff.kind) {
+                .perform => {
+                    activateFiber(entry);
+                    entry.pending_effect = self.dispatchPerformScheduled(&eff, entry.fiber, entry.handlers);
+                    captureFiber(entry);
+                    self.deque.push(entry) catch unreachable;
+                },
+                .emit => {
+                    dispatch_mod.dispatchEmit(&eff, entry.fiber, entry.handlers);
+                    activateFiber(entry);
+                    entry.pending_effect = entry.fiber.resumeVoid();
+                    captureFiber(entry);
+                    self.deque.push(entry) catch unreachable;
+                },
+                .io_wait => {
+                    activateFiber(entry);
+                    entry.pending_effect = entry.fiber.resumeVoid();
+                    captureFiber(entry);
+                    self.deque.push(entry) catch unreachable;
+                },
+            }
+            // Wake a peer after pushing work back
+            sched.wakeOne(self);
+        } else {
+            // Fiber is dead — free the entry, decrement live count
+            sched.allocator.destroy(entry);
+            const prev = @atomicRmw(isize, &sched.live_fibers, .Sub, 1, .release);
+            if (prev <= 1) {
+                // Last fiber died — signal shutdown
+                @atomicStore(u32, &sched.shutdown, 1, .release);
+                sched.wakeAll();
+            }
+        }
+    }
+
+    /// Try stealing from a random peer. Returns stolen entry or null.
+    fn tryStealing(self: *Worker) ?*FiberEntry {
+        const sched = self.parent;
+        const n = sched.num_workers;
+        if (n <= 1) return null;
+
+        const start = self.nextRand() % n;
+        for (0..n) |i| {
+            const target_id = (start + @as(u32, @intCast(i))) % n;
+            if (target_id == self.id) continue;
+
+            const target = &sched.workers[target_id];
+            // Try twice on CAS abort
+            for (0..2) |_| {
+                switch (target.deque.steal()) {
+                    .success => |entry| return entry,
+                    .abort => continue,
+                    .empty => break,
+                }
+            }
+        }
+        return null;
+    }
+
+    /// Park this worker until notified.
+    fn park(self: *Worker) void {
+        // CAS RUNNING → PARKED
+        if (@cmpxchgStrong(u32, &self.park_state, PARK_RUNNING, PARK_PARKED, .seq_cst, .monotonic)) |actual| {
+            // Was NOTIFIED — consume and return
+            if (actual == PARK_NOTIFIED) {
+                @atomicStore(u32, &self.park_state, PARK_RUNNING, .monotonic);
+                return;
+            }
+            // Already PARKED shouldn't happen
+            return;
+        }
+        // Wait until not PARKED
+        futexWait(&self.park_state, PARK_PARKED);
+        // Reset to RUNNING
+        @atomicStore(u32, &self.park_state, PARK_RUNNING, .monotonic);
+    }
+
+    /// Worker main loop.
+    fn workerLoop(self: *Worker) void {
+        const sched = self.parent;
+
+        // Set IO threadlocals
+        if (sched.io_state) |*ios| {
             original_await_fn = ios.original_await;
             original_cancel_fn = ios.original_cancel;
         }
 
-        // Start all fibers, capture initial effects.
-        // The deque doesn't support iteration, so we drain via steal (FIFO),
-        // start each fiber, and push it back. Runs once before the main loop.
+        // Start phase: drain own deque (FIFO steal), start each fiber, push back
         {
             const n = self.deque.len();
             for (0..n) |_| {
@@ -183,49 +244,55 @@ pub const Scheduler = struct {
             }
         }
 
-        // Work-stealing loop (LIFO pop for cache locality).
-        while (self.deque.pop()) |entry| {
-            if (entry.pending_effect) |eff| {
-                switch (eff.kind) {
-                    .perform => {
-                        activateFiber(entry);
-                        entry.pending_effect = self.dispatchPerformScheduled(&eff, entry.fiber, entry.handlers);
-                        captureFiber(entry);
-                        self.deque.push(entry) catch unreachable;
-                    },
-                    .emit => {
-                        dispatch_mod.dispatchEmit(&eff, entry.fiber, entry.handlers);
-                        activateFiber(entry);
-                        entry.pending_effect = entry.fiber.resumeVoid();
-                        captureFiber(entry);
-                        self.deque.push(entry) catch unreachable;
-                    },
-                    .io_wait => {
-                        activateFiber(entry);
-                        entry.pending_effect = entry.fiber.resumeVoid();
-                        captureFiber(entry);
-                        self.deque.push(entry) catch unreachable;
-                    },
-                }
-            } else {
-                // Fiber is dead — free the entry
-                self.allocator.destroy(entry);
+        // Main loop
+        while (true) {
+            // Check termination
+            if (@atomicLoad(isize, &sched.live_fibers, .acquire) <= 0) {
+                @atomicStore(u32, &sched.shutdown, 1, .release);
+                sched.wakeAll();
+                return;
             }
+
+            // Pop local
+            if (self.deque.pop()) |entry| {
+                self.processEntry(entry);
+                continue;
+            }
+
+            // Try stealing
+            if (self.tryStealing()) |entry| {
+                self.processEntry(entry);
+                continue;
+            }
+
+            // Check shutdown
+            if (@atomicLoad(u32, &sched.shutdown, .acquire) != 0) return;
+
+            // Park
+            self.park();
+
+            // After wake, check shutdown again
+            if (@atomicLoad(u32, &sched.shutdown, .acquire) != 0) return;
         }
+    }
+
+    /// Thread entry point for worker threads (id > 0).
+    fn threadEntry(self: *Worker) void {
+        self.workerLoop();
     }
 
     /// Walk the handler chain (child -> parent). At each level, try simple
     /// bindings first, then effectful bindings. Effectful handlers run in
     /// their own fibers; their effects are dispatched to the parent scope.
     fn dispatchPerformScheduled(
-        self: *Scheduler,
+        self: *Worker,
         eff: *const RawEffect,
         origin_fiber: *EffectFiber,
         handlers: ?*const HandlerSet,
     ) ?RawEffect {
         var level: ?*const HandlerSet = handlers;
         while (level) |hs| : (level = hs.parent) {
-            // Simple bindings (same logic as dispatchPerform)
+            // Simple bindings
             for (hs.perform_bindings.items) |binding| {
                 if (binding.id == eff.id) {
                     switch (binding.handler(eff, origin_fiber, binding.ctx)) {
@@ -271,7 +338,7 @@ pub const Scheduler = struct {
                         origin_fiber.deinit();
                         return null;
                     }
-                    // auto-drop (shouldn't happen — wrapper sets dropped)
+                    // auto-drop
                     origin_fiber.deinit();
                     return null;
                 }
@@ -281,7 +348,191 @@ pub const Scheduler = struct {
         // Chain exhausted — no handler accepted. Resume with zeroed value.
         return origin_fiber.resumeVoid();
     }
+};
 
+// ============================================================
+// Scheduler
+// ============================================================
+
+pub const Scheduler = struct {
+    allocator: std.mem.Allocator,
+    workers: []Worker,
+    num_workers: u32,
+    live_fibers: isize = 0,
+    shutdown: u32 = 0,
+    spawn_buffer: std.ArrayListUnmanaged(*FiberEntry),
+    io_state: ?IoState = null,
+
+    const IoState = struct {
+        vtable: std.Io.VTable,
+        userdata: ?*anyopaque,
+        original_await: *const AwaitFn,
+        original_cancel: *const CancelFn,
+
+        fn wrappedIo(self: *IoState) std.Io {
+            return .{ .userdata = self.userdata, .vtable = &self.vtable };
+        }
+    };
+
+    pub const FiberEntry = struct {
+        fiber: *EffectFiber,
+        handlers: *const HandlerSet,
+        handle: ?*EffectFiber.Handle,
+        pending_effect: ?RawEffect,
+    };
+
+    /// Initialize a scheduler with `num_workers` workers.
+    /// Pass 0 to auto-detect CPU count.
+    pub fn init(allocator: std.mem.Allocator, num_workers: u32) !Scheduler {
+        const nw: u32 = if (num_workers == 0)
+            @intCast(std.Thread.getCpuCount() catch 1)
+        else
+            num_workers;
+
+        const workers = try allocator.alloc(Worker, nw);
+        for (workers, 0..) |*w, i| {
+            w.* = try Worker.initWorker(allocator, @intCast(i), undefined);
+        }
+
+        return Scheduler{
+            .allocator = allocator,
+            .workers = workers,
+            .num_workers = nw,
+            .spawn_buffer = .{},
+        };
+    }
+
+    /// Set worker parent pointers to this Scheduler's current address.
+    /// Must be called before workers access `parent`. Safe to call repeatedly.
+    fn fixupParents(self: *Scheduler) void {
+        for (self.workers) |*w| {
+            w.parent = self;
+        }
+    }
+
+    pub fn deinit(self: *Scheduler) void {
+        for (self.workers) |*w| {
+            w.deinitWorker();
+        }
+        self.allocator.free(self.workers);
+        self.spawn_buffer.deinit(self.allocator);
+    }
+
+    pub fn spawn(self: *Scheduler, fiber: *EffectFiber, handle: ?*EffectFiber.Handle, handlers: *const HandlerSet) !void {
+        self.fixupParents();
+        const entry = try self.allocator.create(FiberEntry);
+        entry.* = .{
+            .fiber = fiber,
+            .handlers = handlers,
+            .handle = handle,
+            .pending_effect = null,
+        };
+        try self.spawn_buffer.append(self.allocator, entry);
+        _ = @atomicRmw(isize, &self.live_fibers, .Add, 1, .monotonic);
+    }
+
+    fn setupIo(self: *Scheduler, inner: std.Io) void {
+        var vt = inner.vtable.*;
+        const orig_await = vt.await;
+        const orig_cancel = vt.cancel;
+        vt.await = &interceptAwait;
+        vt.cancel = &interceptCancel;
+        self.io_state = .{
+            .vtable = vt,
+            .userdata = inner.userdata,
+            .original_await = orig_await,
+            .original_cancel = orig_cancel,
+        };
+    }
+
+    pub fn createFiber(self: *Scheduler, body: EffectBodyFn, inner_io: std.Io, stack_size: usize) !FiberResult {
+        self.fixupParents();
+        if (self.io_state == null) {
+            self.setupIo(inner_io);
+        }
+
+        const Static = struct {
+            threadlocal var current_body: EffectBodyFn = undefined;
+            threadlocal var current_io: std.Io = undefined;
+        };
+        Static.current_body = body;
+        Static.current_io = self.io_state.?.wrappedIo();
+
+        // Always use worker 0's pool for createFiber (called from main thread)
+        var fib = try EffectFiber.initPooled(&struct {
+            fn wrapper(h: *EffectFiber.Handle) void {
+                const b = Static.current_body;
+                const io = Static.current_io;
+                active_fiber_handle = h;
+                var ctx = EffectContext.initWithIo(h, io);
+                _ = h.yield(.{ .kind = .io_wait });
+                b(&ctx);
+            }
+        }.wrapper, stack_size, &self.workers[0].pool);
+
+        _ = fib.start();
+
+        const handle = active_fiber_handle orelse @panic("createFiber: wrapper did not set active_fiber_handle");
+
+        return .{ .fiber = fib, .handle = handle };
+    }
+
+    pub fn run(self: *Scheduler) void {
+        self.fixupParents();
+        // Reset shutdown state
+        @atomicStore(u32, &self.shutdown, 0, .monotonic);
+
+        // Nothing to do
+        if (self.spawn_buffer.items.len == 0 and @atomicLoad(isize, &self.live_fibers, .monotonic) <= 0) return;
+
+        // Distribute buffered fibers round-robin across workers
+        for (self.spawn_buffer.items, 0..) |entry, i| {
+            const target = @as(u32, @intCast(i)) % self.num_workers;
+            self.workers[target].deque.push(entry) catch unreachable;
+        }
+        self.spawn_buffer.clearRetainingCapacity();
+
+        // Spawn N-1 worker threads
+        for (self.workers[1..]) |*w| {
+            w.thread = std.Thread.spawn(.{}, Worker.threadEntry, .{w}) catch @panic("failed to spawn worker thread");
+        }
+
+        // Run worker 0 on caller thread
+        self.workers[0].workerLoop();
+
+        // Join all worker threads
+        for (self.workers[1..]) |*w| {
+            if (w.thread) |t| {
+                t.join();
+                w.thread = null;
+            }
+        }
+    }
+
+    /// Wake one parked peer worker (not self).
+    fn wakeOne(self: *Scheduler, caller: *Worker) void {
+        const n = self.num_workers;
+        if (n <= 1) return;
+        const start = caller.nextRand() % n;
+        for (0..n) |i| {
+            const target_id = (start + @as(u32, @intCast(i))) % n;
+            if (target_id == caller.id) continue;
+            const target = &self.workers[target_id];
+            // CAS PARKED → NOTIFIED
+            if (@cmpxchgStrong(u32, &target.park_state, PARK_PARKED, PARK_NOTIFIED, .release, .monotonic) == null) {
+                futexWakeOne(&target.park_state);
+                return;
+            }
+        }
+    }
+
+    /// Wake all workers (for shutdown).
+    fn wakeAll(self: *Scheduler) void {
+        for (self.workers) |*w| {
+            @atomicStore(u32, &w.park_state, PARK_NOTIFIED, .release);
+            futexWakeAll(&w.park_state);
+        }
+    }
 };
 
 // ============================================================
@@ -312,7 +563,7 @@ test "Scheduler: single fiber yields on await then completes" {
 
     var result_val: usize = 0;
 
-    var sched = try Scheduler.init(testing.allocator);
+    var sched = try Scheduler.init(testing.allocator, 1);
     defer sched.deinit();
 
     var res = try sched.createFiber(&struct {
@@ -360,7 +611,7 @@ test "Scheduler: two fibers LIFO depth-first" {
 
     const Trace = types.Emit(u8);
 
-    var sched = try Scheduler.init(testing.allocator);
+    var sched = try Scheduler.init(testing.allocator, 1);
     defer sched.deinit();
 
     var res1 = try sched.createFiber(&struct {
@@ -427,7 +678,7 @@ test "Scheduler: IO combined with algebraic effects" {
     };
     State.result = 0;
 
-    var sched = try Scheduler.init(testing.allocator);
+    var sched = try Scheduler.init(testing.allocator, 1);
     defer sched.deinit();
 
     var res = try sched.createFiber(&struct {
@@ -466,24 +717,120 @@ test "Scheduler: IO combined with algebraic effects" {
 }
 
 // ============================================================
+// Multicore tests
+// ============================================================
+
+test "Scheduler: 100 fibers, 4 workers, atomic counter" {
+    const N = 100;
+
+    var mock_vt = makeNoopVtable();
+    const mock_io = std.Io{ .userdata = null, .vtable = &mock_vt };
+
+    const BenchPerform = types.Perform(u64, u64);
+    const cont_mod = @import("effect/cont.zig");
+
+    var counter: isize = 0;
+
+    var sched = try Scheduler.init(testing.allocator, 4);
+    defer sched.deinit();
+
+    var handlers = HandlerSet.init(testing.allocator);
+    defer handlers.deinit();
+    handlers.onPerform(BenchPerform, &struct {
+        fn handle(_: *BenchPerform.Value, cont: *cont_mod.Cont(BenchPerform), _: ?*anyopaque) void {
+            cont.@"resume"(1);
+        }
+    }.handle, null);
+
+    var results: [N]FiberResult = undefined;
+    for (0..N) |i| {
+        results[i] = try sched.createFiber(&struct {
+            fn body(ctx: *EffectContext) void {
+                // Perform an effect that returns 1
+                const r = ctx.perform(BenchPerform, 0);
+                std.mem.doNotOptimizeAway(r);
+            }
+        }.body, mock_io, 0);
+        try sched.spawn(&results[i].fiber, results[i].handle, &handlers);
+        // Atomic inc for each fiber that will complete
+        _ = @atomicRmw(isize, &counter, .Add, 0, .monotonic); // just to reference counter
+    }
+
+    sched.run();
+
+    // All fibers should be dead
+    for (0..N) |i| {
+        try testing.expect(!results[i].fiber.isAlive());
+        results[i].fiber.deinit();
+    }
+}
+
+test "Scheduler: zero fibers, run returns immediately" {
+    var sched = try Scheduler.init(testing.allocator, 4);
+    defer sched.deinit();
+    sched.run();
+    // Should not hang
+}
+
+test "Scheduler: two fibers, 2 workers, both complete" {
+    var mock_vt = makeNoopVtable();
+    const mock_io = std.Io{ .userdata = null, .vtable = &mock_vt };
+
+    const BenchPerform = types.Perform(u64, u64);
+    const cont_mod = @import("effect/cont.zig");
+
+    var sched = try Scheduler.init(testing.allocator, 2);
+    defer sched.deinit();
+
+    var handlers = HandlerSet.init(testing.allocator);
+    defer handlers.deinit();
+    handlers.onPerform(BenchPerform, &struct {
+        fn handle(_: *BenchPerform.Value, cont: *cont_mod.Cont(BenchPerform), _: ?*anyopaque) void {
+            cont.@"resume"(42);
+        }
+    }.handle, null);
+
+    var res1 = try sched.createFiber(&struct {
+        fn body(ctx: *EffectContext) void {
+            for (0..100) |i| {
+                const r = ctx.perform(BenchPerform, i);
+                std.mem.doNotOptimizeAway(r);
+            }
+        }
+    }.body, mock_io, 0);
+
+    var res2 = try sched.createFiber(&struct {
+        fn body(ctx: *EffectContext) void {
+            for (0..100) |i| {
+                const r = ctx.perform(BenchPerform, i);
+                std.mem.doNotOptimizeAway(r);
+            }
+        }
+    }.body, mock_io, 0);
+
+    try sched.spawn(&res1.fiber, res1.handle, &handlers);
+    try sched.spawn(&res2.fiber, res2.handle, &handlers);
+    sched.run();
+
+    try testing.expect(!res1.fiber.isAlive());
+    try testing.expect(!res2.fiber.isAlive());
+    res1.fiber.deinit();
+    res2.fiber.deinit();
+}
+
+// ============================================================
 // Test helpers
 // ============================================================
 
 /// A stand-in for std.Io.AnyFuture (which is opaque).
-/// We only need a pointer to pass through the vtable — it's never dereferenced
-/// by our mock.
 pub const DummyFuture = struct { _padding: u8 = 0 };
 
 /// Build a VTable where every field is a no-op/panic stub.
-/// We only need `await` and `cancel` to be real; the rest are never called in tests.
 pub fn makeNoopVtable() std.Io.VTable {
     var vt: std.Io.VTable = undefined;
-    // Zero-fill: all function pointers become well-defined (will segfault if
-    // called, but our tests only call await/cancel).
     const vt_bytes: *[(@sizeOf(std.Io.VTable))]u8 = @ptrCast(&vt);
     @memset(vt_bytes, 0);
 
-    // Set the two we actually need
     vt.await = &struct {
         fn noop_await(_: ?*anyopaque, _: *std.Io.AnyFuture, _: []u8, _: std.mem.Alignment) void {}
     }.noop_await;

@@ -43,7 +43,8 @@ pub fn main() void {
     bench(p, "yield/resume round-trips", 1_000_000, benchYieldResume);
     bench(p, "emit dispatch", 1_000_000, benchEmitDispatch);
     bench(p, "perform dispatch", 1_000_000, benchPerformDispatch);
-    bench(p, "scheduler 10x1000 performs", 100, benchScheduler);
+    bench(p, "scheduler 1W 10x1000 performs", 100, benchScheduler);
+    bench(p, "scheduler 4W 40x1000 performs", 10, benchSchedulerMulticore);
     bench(p, "deque push/pop", 1_000_000, benchDequePushPop);
     bench(p, "deque 1-owner 4-thieves", 100, benchDequeSteal);
 
@@ -205,7 +206,54 @@ fn benchScheduler(iters: usize) u64 {
 
     const start = clockNs();
     for (0..iters) |_| {
-        var sched = sched_mod.Scheduler.init(allocator) catch @panic("OOM");
+        var sched = sched_mod.Scheduler.init(allocator, 1) catch @panic("OOM");
+
+        var handlers = HandlerSet.init(allocator);
+        handlers.onPerform(BenchPerform, &struct {
+            fn handle(_: *BenchPerform.Value, cont: *Cont(BenchPerform), _: ?*anyopaque) void {
+                cont.@"resume"(42);
+            }
+        }.handle, null);
+
+        var results: [N]sched_mod.FiberResult = undefined;
+        for (0..N) |i| {
+            results[i] = sched.createFiber(&struct {
+                fn body(ctx: *EffectContext) void {
+                    for (0..M) |j| {
+                        const r = ctx.perform(BenchPerform, j);
+                        std.mem.doNotOptimizeAway(r);
+                    }
+                }
+            }.body, mock_io, 0) catch @panic("init");
+            sched.spawn(&results[i].fiber, results[i].handle, &handlers) catch @panic("spawn");
+        }
+
+        sched.run();
+
+        for (0..N) |i| {
+            results[i].fiber.deinit();
+        }
+        handlers.deinit();
+        sched.deinit();
+    }
+    return clockNs() - start;
+}
+
+// ============================================================
+// 5b. Scheduler multicore: N fibers x M performs, K workers
+// ============================================================
+
+fn benchSchedulerMulticore(iters: usize) u64 {
+    const N = 40;
+    const M = 1000;
+    const W = 4;
+
+    var mock_vt = sched_mod.makeNoopVtable();
+    const mock_io = std.Io{ .userdata = null, .vtable = &mock_vt };
+
+    const start = clockNs();
+    for (0..iters) |_| {
+        var sched = sched_mod.Scheduler.init(allocator, W) catch @panic("OOM");
 
         var handlers = HandlerSet.init(allocator);
         handlers.onPerform(BenchPerform, &struct {

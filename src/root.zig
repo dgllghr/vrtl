@@ -107,7 +107,7 @@ test "Scheduler: nested handler chain with multi-file IO across fibers" {
     const mock_io = std.Io{ .userdata = null, .vtable = &mock_vt };
 
     // -- Scheduler (must exist before creating IO fibers) --
-    var sched = try Scheduler.init(testing.allocator);
+    var sched = try Scheduler.init(testing.allocator, 1);
     defer sched.deinit();
 
     // -- Fibers --
