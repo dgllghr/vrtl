@@ -1,16 +1,14 @@
 # vrtl
 
-Experimental algebraic effects for Zig, built on [minicoro](https://github.com/edubart/minicoro).
+Algebraic effects for Zig with multicore work-stealing.
 
 **This is a research prototype.** It works on Zig 0.16-dev (nightly) only.
-Performance is not competitive with native runtime implementations like
-OCaml 5. Single-threaded only.
+ARM64 (Apple Silicon) only for now.
 
-The stackless coroutines
-[being considered](https://github.com/ziglang/zig/issues/23446) for a future
-Zig release would be a much better foundation than minicoro's stackful
-coroutines — smaller memory footprint, no C FFI overhead on context switch,
-and potential for compiler-driven optimizations.
+Pure Zig coroutine runtime — no C dependencies. Multicore scheduler with
+N worker threads, per-worker Chase-Lev deques, and futex-based parking.
+Competitive with OCaml 5's effect handler performance (~1.6x faster
+single-threaded effect dispatch, comparable multicore throughput).
 
 ## What it does
 
@@ -24,9 +22,9 @@ Two kinds of effects:
   result. Like a function call that goes through an indirection layer.
 - **Emit** — the fiber notifies observers and continues. Fire-and-observe.
 
-A `Scheduler` manages multiple fibers cooperatively and integrates with Zig's
-`std.Io` so that fibers yield on IO operations and other fibers can run in the
-meantime.
+A multicore `Scheduler` manages fibers across N worker threads with
+work-stealing and integrates with Zig's `std.Io` so that fibers yield on IO
+operations and other fibers can run in the meantime.
 
 ## Usage
 
@@ -89,14 +87,15 @@ vt.run(&fib, &handlers);
 For multiple fibers with IO scheduling:
 
 ```zig
-var sched = vt.Scheduler.init(allocator);
+// 0 = auto-detect CPU count, or pass an explicit worker count
+var sched = try vt.Scheduler.init(allocator, 0);
 defer sched.deinit();
 
 var res = try sched.createFiber(&myBody, io, 0);
 defer res.fiber.deinit();
 
 try sched.spawn(&res.fiber, res.handle, &handlers);
-sched.run();
+sched.run();  // distributes fibers across workers, blocks until all complete
 ```
 
 ### Handler composition
@@ -129,7 +128,7 @@ vt.run(&fib, &cache);
 
 ## Building
 
-Requires Zig 0.16-dev and a C compiler (for minicoro).
+Requires Zig 0.16-dev. No C dependencies.
 
 ```
 zig build test
