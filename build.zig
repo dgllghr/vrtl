@@ -41,15 +41,6 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
 
-    // Compile minicoro from the single-header C source and link it into vrtl.
-    mod.addCSourceFile(.{
-        .file = b.path("c/minicoro.h"),
-        .flags = &.{"-DMINICORO_IMPL"},
-        .language = .c,
-    });
-    mod.addIncludePath(b.path("c"));
-    mod.link_libc = true;
-
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
     // to the module defined above, it's sometimes preferable to split business
@@ -172,13 +163,6 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseFast,
         }),
     });
-    bench_exe.root_module.addCSourceFile(.{
-        .file = b.path("c/minicoro.h"),
-        .flags = &.{"-DMINICORO_IMPL"},
-        .language = .c,
-    });
-    bench_exe.root_module.addIncludePath(b.path("c"));
-    bench_exe.root_module.link_libc = true;
     b.installArtifact(bench_exe);
 
     const run_bench = b.addRunArtifact(bench_exe);

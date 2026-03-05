@@ -1,11 +1,11 @@
-// Typed fibers built on minicoro.
+// Typed fibers built on the pure Zig coroutine runtime.
 //
-// A Fiber(Y, R) wraps a minicoro coroutine with typed yield/resume:
+// A Fiber(Y, R) wraps a coroutine with typed yield/resume:
 //   - The fiber yields values of type Y
 //   - The fiber receives values of type R when resumed
 //
 // Non-zero-size yield/resume values are passed via threadlocal
-// pointers — no memcpy through minicoro's storage buffer.
+// pointers — no memcpy overhead.
 
 const std = @import("std");
 const coro = @import("coro.zig");
@@ -71,11 +71,10 @@ pub fn Fiber(comptime YieldT: type, comptime ResumeT: type) type {
         };
 
         const Wrapper = struct {
-            fn entry(co: ?*coro.Coro) callconv(.c) void {
-                const c = co orelse @panic("null coro");
+            fn entry(co: *coro.Coro) void {
                 const body_ptr: *const BodyFn = @ptrCast(@alignCast(
-                    coro.getUserData(c) orelse @panic("no user_data")));
-                var handle = Handle{ .co = c };
+                    coro.getUserData(co) orelse @panic("no user_data")));
+                var handle = Handle{ .co = co };
                 body_ptr.*(&handle);
             }
         };
@@ -108,7 +107,7 @@ pub fn Fiber(comptime YieldT: type, comptime ResumeT: type) type {
 
         /// Create with default stack size (64KB).
         pub fn initDefault(body: BodyFn) !Self {
-            return init(body, 0); // 0 = use minicoro default
+            return init(body, 0); // 0 = use default (64KB)
         }
 
         /// Destroy the fiber and free its stack. Idempotent —
@@ -182,7 +181,7 @@ pub fn Fiber(comptime YieldT: type, comptime ResumeT: type) type {
 
         fn afterResume(self: *Self) ?YieldT {
             const s = coro.status(self.co);
-            if (s == coro.c.MCO_SUSPENDED) {
+            if (s == .suspended) {
                 self.state = .suspended;
                 if (comptime @sizeOf(YieldT) > 0) {
                     return Slots.yield_ptr.*;
@@ -267,17 +266,16 @@ test "bidirectional fiber passes values both ways" {
 
 test "consumer receives values via yieldVoid" {
     const C = Consumer(i32);
-    var total: i32 = 0;
+    const State = struct {
+        threadlocal var sum: i32 = 0;
+    };
+    State.sum = 0;
+
     var c = try C.initDefault(&struct {
         fn body(h: *C.Handle) void {
-            var sum: i32 = 0;
-            sum += h.yieldVoid(); // suspend, wait for value
-            sum += h.yieldVoid();
-            sum += h.yieldVoid();
-            // Store result where the test can read it. We use the
-            // coroutine's own storage for this via a final yield.
-            const co = h.co;
-            coro.push(co, std.mem.asBytes(&sum)) catch @panic("push");
+            State.sum += h.yieldVoid(); // suspend, wait for value
+            State.sum += h.yieldVoid();
+            State.sum += h.yieldVoid();
         }
     }.body);
     defer c.deinit();
@@ -286,11 +284,7 @@ test "consumer receives values via yieldVoid" {
     _ = c.@"resume"(10);
     _ = c.@"resume"(20);
     _ = c.@"resume"(30);
-    // Fiber is dead now; read the sum it pushed before exiting.
-    var buf: [@sizeOf(i32)]u8 = undefined;
-    coro.pop(c.co, &buf) catch @panic("pop");
-    total = std.mem.bytesToValue(i32, &buf);
-    try std.testing.expectEqual(@as(i32, 60), total);
+    try std.testing.expectEqual(@as(i32, 60), State.sum);
 }
 
 test "resuming a non-suspended fiber returns null" {

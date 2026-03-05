@@ -19,10 +19,16 @@ const BenchPerform = types.Perform(u64, u64);
 const allocator = std.heap.page_allocator;
 
 fn clockNs() u64 {
-    var ts: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC_RAW, &ts);
-    return @intCast(@as(i128, ts.sec) * 1_000_000_000 + ts.nsec);
+    // Read ARM64 hardware counter directly — no libc needed
+    const cnt: u64 = asm volatile ("mrs %[cnt], cntvct_el0"
+        : [cnt] "=r" (-> u64),
+    );
+    const freq: u64 = asm volatile ("mrs %[freq], cntfrq_el0"
+        : [freq] "=r" (-> u64),
+    );
+    return @intCast(@as(u128, cnt) * 1_000_000_000 / freq);
 }
+
 
 pub fn main() void {
     const p = std.debug.print;
