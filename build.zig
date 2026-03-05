@@ -154,6 +154,27 @@ pub fn build(b: *std.Build) void {
     // Lastly, the Zig build system is relatively simple and self-contained,
     // and reading its source code will allow you to master it.
 
+    // Examples
+    const echo_server = b.addExecutable(.{
+        .name = "echo-server",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/echo_server.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "vrtl", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(echo_server);
+
+    const run_echo = b.addRunArtifact(echo_server);
+    run_echo.step.dependOn(b.getInstallStep());
+    if (b.args) |args| run_echo.addArgs(args);
+
+    const echo_step = b.step("echo-server", "Run TCP echo server example");
+    echo_step.dependOn(&run_echo.step);
+
     // Benchmarks — always built with ReleaseFast.
     const bench_exe = b.addExecutable(.{
         .name = "bench",
