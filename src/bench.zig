@@ -6,6 +6,7 @@ const dispatch_mod = @import("effect/dispatch.zig");
 const cont_mod = @import("effect/cont.zig");
 const sched_mod = @import("scheduler.zig");
 const pool_mod = @import("pool.zig");
+const deque_mod = @import("deque.zig");
 
 const EffectFiber = types.EffectFiber;
 const EffectContext = types.EffectContext;
@@ -37,6 +38,8 @@ pub fn main() void {
     bench(p, "emit dispatch", 1_000_000, benchEmitDispatch);
     bench(p, "perform dispatch", 1_000_000, benchPerformDispatch);
     bench(p, "scheduler 10x1000 performs", 100, benchScheduler);
+    bench(p, "deque push/pop", 1_000_000, benchDequePushPop);
+    bench(p, "deque 1-owner 4-thieves", 100, benchDequeSteal);
 
     p("\n", .{});
 }
@@ -226,5 +229,111 @@ fn benchScheduler(iters: usize) u64 {
         handlers.deinit();
         sched.deinit();
     }
+    return clockNs() - start;
+}
+
+// ============================================================
+// 6. Deque push/pop (single-threaded owner throughput)
+// ============================================================
+
+fn benchDequePushPop(iters: usize) u64 {
+    const Deque = deque_mod.WorkStealingDeque(u64);
+    var d = Deque.init(allocator, 1024) catch @panic("OOM");
+    defer d.deinit();
+
+    const start = clockNs();
+    for (0..iters) |i| {
+        d.push(i) catch unreachable;
+        std.mem.doNotOptimizeAway(d.pop());
+    }
+    return clockNs() - start;
+}
+
+// ============================================================
+// 7. Deque 1-owner + 4-thieves (multi-threaded work-stealing)
+// ============================================================
+
+fn benchDequeSteal(iters: usize) u64 {
+    // Each iteration: owner pushes 100k items in waves, pops between waves.
+    // 4 thief threads steal concurrently. Measures total throughput.
+    const num_thieves = 4;
+    const items_per_iter: u64 = 100_000;
+    const wave_size: u64 = 500;
+
+    const Deque = deque_mod.WorkStealingDeque(u64);
+
+    const ThiefCtx = struct {
+        deque: *Deque,
+        done: *u32,
+        stolen: u64,
+    };
+
+    const start = clockNs();
+
+    for (0..iters) |_| {
+        var deque = Deque.init(allocator, 1024) catch @panic("OOM");
+        defer deque.deinit();
+
+        var done: u32 = 0;
+        var ctxs: [num_thieves]ThiefCtx = undefined;
+        var threads: [num_thieves]std.Thread = undefined;
+
+        for (0..num_thieves) |i| {
+            ctxs[i] = .{ .deque = &deque, .done = &done, .stolen = 0 };
+            threads[i] = std.Thread.spawn(.{}, struct {
+                fn run(ctx: *ThiefCtx) void {
+                    var count: u64 = 0;
+                    while (true) {
+                        switch (ctx.deque.steal()) {
+                            .success => count += 1,
+                            .abort => continue,
+                            .empty => {
+                                if (@atomicLoad(u32, ctx.done, .acquire) == 1) {
+                                    while (true) {
+                                        switch (ctx.deque.steal()) {
+                                            .success => count += 1,
+                                            .abort => continue,
+                                            .empty => {
+                                                ctx.stolen = count;
+                                                return;
+                                            },
+                                        }
+                                    }
+                                }
+                            },
+                        }
+                    }
+                }
+            }.run, .{&ctxs[i]}) catch @panic("spawn");
+        }
+
+        // Owner: push in waves, pop half between waves.
+        var pushed: u64 = 0;
+        var owner_popped: u64 = 0;
+        while (pushed < items_per_iter) {
+            const wave_end = @min(pushed + wave_size, items_per_iter);
+            while (pushed < wave_end) : (pushed += 1) {
+                deque.push(pushed) catch unreachable;
+            }
+            for (0..wave_size / 2) |_| {
+                if (deque.pop()) |_| {
+                    owner_popped += 1;
+                }
+            }
+        }
+        while (deque.pop()) |_| {
+            owner_popped += 1;
+        }
+        @atomicStore(u32, &done, 1, .release);
+
+        var total_stolen: u64 = 0;
+        for (0..num_thieves) |i| {
+            threads[i].join();
+            total_stolen += ctxs[i].stolen;
+        }
+        std.mem.doNotOptimizeAway(owner_popped);
+        std.mem.doNotOptimizeAway(total_stolen);
+    }
+
     return clockNs() - start;
 }
