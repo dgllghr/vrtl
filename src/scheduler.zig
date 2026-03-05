@@ -18,44 +18,116 @@ const EffectBodyFn = types.EffectBodyFn;
 const EffectKind = types.EffectKind;
 const HandlerSet = handler_mod.HandlerSet;
 
+const net = std.Io.net;
+
 const AwaitFn = fn (?*anyopaque, *std.Io.AnyFuture, []u8, std.mem.Alignment) void;
 const CancelFn = fn (?*anyopaque, *std.Io.AnyFuture, []u8, std.mem.Alignment) void;
+const NetAcceptFn = fn (?*anyopaque, net.Socket.Handle) net.Server.AcceptError!net.Stream;
+const NetReadFn = fn (?*anyopaque, net.Socket.Handle, [][]u8) net.Stream.Reader.Error!usize;
+const NetWriteFn = fn (?*anyopaque, net.Socket.Handle, []const u8, []const []const u8, usize) net.Stream.Writer.Error!usize;
 
+/// Type-erased pending IO operation. Each interceptor creates a stack-local
+/// Ctx that captures the original fn + args + a result slot. The BG thread
+/// calls run_fn(ctx), which writes the result into Ctx. The fiber reads
+/// the result after being resumed.
 const PendingIo = struct {
-    userdata: ?*anyopaque,
-    future: *std.Io.AnyFuture,
-    result_buf: []u8,
-    alignment: std.mem.Alignment,
-    await_fn: *const AwaitFn,
+    run_fn: *const fn (*anyopaque) void,
+    ctx: *anyopaque,
 };
 
 /// Threadlocal holding the active fiber handle for the currently-executing fiber.
 /// Set by Worker before each resume, read by interceptAwait.
 pub threadlocal var active_fiber_handle: ?*EffectFiber.Handle = null;
 
-/// Original await/cancel function pointers, set once per worker thread from IoState.
+/// Original function pointers, set once per worker thread from IoState.
 threadlocal var original_await_fn: *const AwaitFn = undefined;
 threadlocal var original_cancel_fn: *const CancelFn = undefined;
+threadlocal var original_net_accept_fn: *const NetAcceptFn = undefined;
+threadlocal var original_net_read_fn: *const NetReadFn = undefined;
+threadlocal var original_net_write_fn: *const NetWriteFn = undefined;
 
 /// Threadlocal for passing IO args from interceptAwait to the scheduler.
 threadlocal var pending_io: ?PendingIo = null;
 
 fn interceptAwait(userdata: ?*anyopaque, future: *std.Io.AnyFuture, result_buf: []u8, alignment: std.mem.Alignment) void {
     const handle = active_fiber_handle orelse @panic("interceptAwait called without active fiber handle");
-    pending_io = .{
-        .userdata = userdata,
-        .future = future,
-        .result_buf = result_buf,
-        .alignment = alignment,
-        .await_fn = original_await_fn,
+    const Ctx = struct {
+        ud: ?*anyopaque,
+        fut: *std.Io.AnyFuture,
+        buf: []u8,
+        align_: std.mem.Alignment,
+        orig: *const AwaitFn,
+        fn run(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.orig(self.ud, self.fut, self.buf, self.align_);
+        }
     };
+    var ctx = Ctx{ .ud = userdata, .fut = future, .buf = result_buf, .align_ = alignment, .orig = original_await_fn };
+    pending_io = .{ .run_fn = &Ctx.run, .ctx = @ptrCast(&ctx) };
     _ = handle.yield(.{ .kind = .io_wait });
-    // When resumed: IO is done, result_buf already filled by BG thread
 }
 
 fn interceptCancel(userdata: ?*anyopaque, future: *std.Io.AnyFuture, result_buf: []u8, alignment: std.mem.Alignment) void {
     _ = active_fiber_handle orelse @panic("interceptCancel called without active fiber handle");
     original_cancel_fn(userdata, future, result_buf, alignment);
+}
+
+fn interceptNetAccept(userdata: ?*anyopaque, server_handle: net.Socket.Handle) net.Server.AcceptError!net.Stream {
+    const h = active_fiber_handle orelse @panic("interceptNetAccept called without active fiber handle");
+    const Ctx = struct {
+        ud: ?*anyopaque,
+        hnd: net.Socket.Handle,
+        orig: *const NetAcceptFn,
+        result: net.Server.AcceptError!net.Stream = error.NetworkDown,
+        fn run(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.result = self.orig(self.ud, self.hnd);
+        }
+    };
+    var ctx = Ctx{ .ud = userdata, .hnd = server_handle, .orig = original_net_accept_fn };
+    pending_io = .{ .run_fn = &Ctx.run, .ctx = @ptrCast(&ctx) };
+    _ = h.yield(.{ .kind = .io_wait });
+    return ctx.result;
+}
+
+fn interceptNetRead(userdata: ?*anyopaque, src: net.Socket.Handle, data: [][]u8) net.Stream.Reader.Error!usize {
+    const h = active_fiber_handle orelse @panic("interceptNetRead called without active fiber handle");
+    const Ctx = struct {
+        ud: ?*anyopaque,
+        hnd: net.Socket.Handle,
+        data: [][]u8,
+        orig: *const NetReadFn,
+        result: net.Stream.Reader.Error!usize = error.NetworkDown,
+        fn run(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.result = self.orig(self.ud, self.hnd, self.data);
+        }
+    };
+    var ctx = Ctx{ .ud = userdata, .hnd = src, .data = data, .orig = original_net_read_fn };
+    pending_io = .{ .run_fn = &Ctx.run, .ctx = @ptrCast(&ctx) };
+    _ = h.yield(.{ .kind = .io_wait });
+    return ctx.result;
+}
+
+fn interceptNetWrite(userdata: ?*anyopaque, dest: net.Socket.Handle, header: []const u8, data: []const []const u8, splat: usize) net.Stream.Writer.Error!usize {
+    const h = active_fiber_handle orelse @panic("interceptNetWrite called without active fiber handle");
+    const Ctx = struct {
+        ud: ?*anyopaque,
+        hnd: net.Socket.Handle,
+        header: []const u8,
+        data: []const []const u8,
+        splat: usize,
+        orig: *const NetWriteFn,
+        result: net.Stream.Writer.Error!usize = error.NetworkDown,
+        fn run(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.result = self.orig(self.ud, self.hnd, self.header, self.data, self.splat);
+        }
+    };
+    var ctx = Ctx{ .ud = userdata, .hnd = dest, .header = header, .data = data, .splat = splat, .orig = original_net_write_fn };
+    pending_io = .{ .run_fn = &Ctx.run, .ctx = @ptrCast(&ctx) };
+    _ = h.yield(.{ .kind = .io_wait });
+    return ctx.result;
 }
 
 /// Result of createFiber — bundles the fiber with its handle pointer.
@@ -198,6 +270,8 @@ pub const Worker = struct {
                     activateFiber(entry);
                     entry.pending_effect = self.dispatchPerformScheduled(&eff, entry.fiber, entry.handlers);
                     captureFiber(entry);
+                    entry.pending_io = pending_io;
+                    pending_io = null;
                     self.deque.push(entry) catch unreachable;
                 },
                 .emit => {
@@ -205,6 +279,8 @@ pub const Worker = struct {
                     activateFiber(entry);
                     entry.pending_effect = entry.fiber.resumeVoid();
                     captureFiber(entry);
+                    entry.pending_io = pending_io;
+                    pending_io = null;
                     self.deque.push(entry) catch unreachable;
                 },
                 .io_wait => {
@@ -276,12 +352,10 @@ pub const Worker = struct {
         const t = std.Thread.spawn(.{ .stack_size = 64 * 1024 }, struct {
             fn run(w: *Worker, e: *FiberEntry, s: *Scheduler) void {
                 const io = e.pending_io.?;
-                io.await_fn(io.userdata, io.future, io.result_buf, io.alignment);
+                io.run_fn(io.ctx);
                 e.pending_io = null;
-                // Mark ready to resume (io_wait with no pending_io → immediate resume)
                 e.pending_effect = .{ .kind = .io_wait };
                 w.inbox.push(s.allocator, e);
-                // Wake the worker
                 if (@cmpxchgStrong(u32, &w.park_state, PARK_PARKED, PARK_NOTIFIED, .release, .monotonic) == null) {
                     futexWakeOne(&w.park_state);
                 }
@@ -319,6 +393,9 @@ pub const Worker = struct {
         if (sched.io_state) |*ios| {
             original_await_fn = ios.original_await;
             original_cancel_fn = ios.original_cancel;
+            original_net_accept_fn = ios.original_net_accept;
+            original_net_read_fn = ios.original_net_read;
+            original_net_write_fn = ios.original_net_write;
         }
 
         // Start phase: drain own deque (FIFO steal), start each fiber, push back
@@ -473,6 +550,9 @@ pub const Scheduler = struct {
         userdata: ?*anyopaque,
         original_await: *const AwaitFn,
         original_cancel: *const CancelFn,
+        original_net_accept: *const NetAcceptFn,
+        original_net_read: *const NetReadFn,
+        original_net_write: *const NetWriteFn,
 
         fn wrappedIo(self: *IoState) std.Io {
             return .{ .userdata = self.userdata, .vtable = &self.vtable };
@@ -542,13 +622,22 @@ pub const Scheduler = struct {
         var vt = inner.vtable.*;
         const orig_await = vt.await;
         const orig_cancel = vt.cancel;
+        const orig_net_accept = vt.netAccept;
+        const orig_net_read = vt.netRead;
+        const orig_net_write = vt.netWrite;
         vt.await = &interceptAwait;
         vt.cancel = &interceptCancel;
+        vt.netAccept = &interceptNetAccept;
+        vt.netRead = &interceptNetRead;
+        vt.netWrite = &interceptNetWrite;
         self.io_state = .{
             .vtable = vt,
             .userdata = inner.userdata,
             .original_await = orig_await,
             .original_cancel = orig_cancel,
+            .original_net_accept = orig_net_accept,
+            .original_net_read = orig_net_read,
+            .original_net_write = orig_net_write,
         };
     }
 
