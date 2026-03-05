@@ -21,6 +21,14 @@ const HandlerSet = handler_mod.HandlerSet;
 const AwaitFn = fn (?*anyopaque, *std.Io.AnyFuture, []u8, std.mem.Alignment) void;
 const CancelFn = fn (?*anyopaque, *std.Io.AnyFuture, []u8, std.mem.Alignment) void;
 
+const PendingIo = struct {
+    userdata: ?*anyopaque,
+    future: *std.Io.AnyFuture,
+    result_buf: []u8,
+    alignment: std.mem.Alignment,
+    await_fn: *const AwaitFn,
+};
+
 /// Threadlocal holding the active fiber handle for the currently-executing fiber.
 /// Set by Worker before each resume, read by interceptAwait.
 pub threadlocal var active_fiber_handle: ?*EffectFiber.Handle = null;
@@ -29,10 +37,20 @@ pub threadlocal var active_fiber_handle: ?*EffectFiber.Handle = null;
 threadlocal var original_await_fn: *const AwaitFn = undefined;
 threadlocal var original_cancel_fn: *const CancelFn = undefined;
 
+/// Threadlocal for passing IO args from interceptAwait to the scheduler.
+threadlocal var pending_io: ?PendingIo = null;
+
 fn interceptAwait(userdata: ?*anyopaque, future: *std.Io.AnyFuture, result_buf: []u8, alignment: std.mem.Alignment) void {
     const handle = active_fiber_handle orelse @panic("interceptAwait called without active fiber handle");
+    pending_io = .{
+        .userdata = userdata,
+        .future = future,
+        .result_buf = result_buf,
+        .alignment = alignment,
+        .await_fn = original_await_fn,
+    };
     _ = handle.yield(.{ .kind = .io_wait });
-    original_await_fn(userdata, future, result_buf, alignment);
+    // When resumed: IO is done, result_buf already filled by BG thread
 }
 
 fn interceptCancel(userdata: ?*anyopaque, future: *std.Io.AnyFuture, result_buf: []u8, alignment: std.mem.Alignment) void {
@@ -86,9 +104,45 @@ fn futexWakeAll(ptr: *u32) void {
 // Worker
 // ============================================================
 
+fn spinLock(m: *std.atomic.Mutex) void {
+    while (!m.tryLock()) {}
+}
+
+const Inbox = struct {
+    mu: std.atomic.Mutex = .unlocked,
+    items: std.ArrayListUnmanaged(*Scheduler.FiberEntry) = .{},
+
+    fn push(self: *Inbox, allocator: std.mem.Allocator, entry: *Scheduler.FiberEntry) void {
+        spinLock(&self.mu);
+        defer self.mu.unlock();
+        self.items.append(allocator, entry) catch @panic("OOM: inbox push");
+    }
+
+    fn drain(self: *Inbox, deque: *Deque(*Scheduler.FiberEntry)) usize {
+        spinLock(&self.mu);
+        const slice = self.items.items;
+        const count = slice.len;
+        if (count == 0) {
+            self.mu.unlock();
+            return 0;
+        }
+        for (slice) |entry| {
+            deque.push(entry) catch unreachable;
+        }
+        self.items.clearRetainingCapacity();
+        self.mu.unlock();
+        return count;
+    }
+
+    fn deinit(self: *Inbox, allocator: std.mem.Allocator) void {
+        self.items.deinit(allocator);
+    }
+};
+
 pub const Worker = struct {
     deque: Deque(*Scheduler.FiberEntry),
     pool: StackPool = .{},
+    inbox: Inbox = .{},
     thread: ?std.Thread = null,
     id: u32,
     parent: *Scheduler,
@@ -110,6 +164,7 @@ pub const Worker = struct {
             self.parent.allocator.destroy(entry);
         }
         self.deque.deinit();
+        self.inbox.deinit(self.parent.allocator);
     }
 
     /// xorshift32 PRNG for steal target selection.
@@ -153,10 +208,27 @@ pub const Worker = struct {
                     self.deque.push(entry) catch unreachable;
                 },
                 .io_wait => {
-                    activateFiber(entry);
-                    entry.pending_effect = entry.fiber.resumeVoid();
-                    captureFiber(entry);
-                    self.deque.push(entry) catch unreachable;
+                    // Check entry first (captured in start phase), then TLS
+                    const pio = entry.pending_io orelse blk: {
+                        const tls = pending_io;
+                        pending_io = null;
+                        break :blk tls;
+                    };
+                    if (pio) |io_args| {
+                        // Real IO — park fiber, submit to BG thread
+                        entry.pending_io = io_args;
+                        self.submitIoWait(entry);
+                    } else {
+                        // Initial yield or no-op — resume immediately
+                        entry.pending_io = null;
+                        activateFiber(entry);
+                        entry.pending_effect = entry.fiber.resumeVoid();
+                        captureFiber(entry);
+                        // Capture any new pending_io from the resumed fiber
+                        entry.pending_io = pending_io;
+                        pending_io = null;
+                        self.deque.push(entry) catch unreachable;
+                    }
                 },
             }
             // Wake a peer after pushing work back
@@ -195,6 +267,30 @@ pub const Worker = struct {
             }
         }
         return null;
+    }
+
+    /// Submit a fiber's IO to a background thread so the worker stays free.
+    fn submitIoWait(self: *Worker, entry: *FiberEntry) void {
+        const sched = self.parent;
+        const worker_ptr = self;
+        const t = std.Thread.spawn(.{ .stack_size = 64 * 1024 }, struct {
+            fn run(w: *Worker, e: *FiberEntry, s: *Scheduler) void {
+                const io = e.pending_io.?;
+                io.await_fn(io.userdata, io.future, io.result_buf, io.alignment);
+                e.pending_io = null;
+                // Mark ready to resume (io_wait with no pending_io → immediate resume)
+                e.pending_effect = .{ .kind = .io_wait };
+                w.inbox.push(s.allocator, e);
+                // Wake the worker
+                if (@cmpxchgStrong(u32, &w.park_state, PARK_PARKED, PARK_NOTIFIED, .release, .monotonic) == null) {
+                    futexWakeOne(&w.park_state);
+                }
+            }
+        }.run, .{ worker_ptr, entry, sched }) catch @panic("failed to spawn IO thread");
+
+        spinLock(&sched.io_threads_mu);
+        sched.io_threads.append(sched.allocator, t) catch @panic("OOM: io_threads append");
+        sched.io_threads_mu.unlock();
     }
 
     /// Park this worker until notified.
@@ -240,12 +336,19 @@ pub const Worker = struct {
                     entry.pending_effect = entry.fiber.start();
                 }
                 captureFiber(entry);
+                // Capture pending_io before next fiber overwrites TLS
+                entry.pending_io = pending_io;
+                pending_io = null;
                 self.deque.push(entry) catch unreachable;
             }
         }
 
         // Main loop
         while (true) {
+            // Drain inbox (completed IO from BG threads)
+            const drained = self.inbox.drain(&self.deque);
+            if (drained > 0) continue;
+
             // Check termination
             if (@atomicLoad(isize, &sched.live_fibers, .acquire) <= 0) {
                 @atomicStore(u32, &sched.shutdown, 1, .release);
@@ -362,6 +465,8 @@ pub const Scheduler = struct {
     shutdown: u32 = 0,
     spawn_buffer: std.ArrayListUnmanaged(*FiberEntry),
     io_state: ?IoState = null,
+    io_threads_mu: std.atomic.Mutex = .unlocked,
+    io_threads: std.ArrayListUnmanaged(std.Thread) = .{},
 
     const IoState = struct {
         vtable: std.Io.VTable,
@@ -379,6 +484,7 @@ pub const Scheduler = struct {
         handlers: *const HandlerSet,
         handle: ?*EffectFiber.Handle,
         pending_effect: ?RawEffect,
+        pending_io: ?PendingIo = null,
     };
 
     /// Initialize a scheduler with `num_workers` workers.
@@ -416,6 +522,7 @@ pub const Scheduler = struct {
         }
         self.allocator.free(self.workers);
         self.spawn_buffer.deinit(self.allocator);
+        self.io_threads.deinit(self.allocator);
     }
 
     pub fn spawn(self: *Scheduler, fiber: *EffectFiber, handle: ?*EffectFiber.Handle, handlers: *const HandlerSet) !void {
@@ -507,6 +614,12 @@ pub const Scheduler = struct {
                 w.thread = null;
             }
         }
+
+        // Join all IO background threads
+        for (self.io_threads.items) |t| {
+            t.join();
+        }
+        self.io_threads.clearRetainingCapacity();
     }
 
     /// Wake one parked peer worker (not self).
@@ -816,6 +929,201 @@ test "Scheduler: two fibers, 2 workers, both complete" {
     try testing.expect(!res2.fiber.isAlive());
     res1.fiber.deinit();
     res2.fiber.deinit();
+}
+
+// ============================================================
+// Non-blocking IO tests
+// ============================================================
+
+test "Scheduler: IO does not block worker" {
+    // 2 fibers on 1 worker. Each does a mock await that sleeps 50ms.
+    // If IO is non-blocking (parallel BG threads), wall-clock should be ~50ms, not ~100ms.
+    const State = struct {
+        var completed: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+    };
+    State.completed = std.atomic.Value(u32).init(0);
+
+    var mock_vt = makeNoopVtable();
+    mock_vt.await = &struct {
+        fn slow_await(_: ?*anyopaque, _: *std.Io.AnyFuture, _: []u8, _: std.mem.Alignment) void {
+            const ts: std.c.timespec = .{ .sec = 0, .nsec = 50_000_000 };
+            _ = std.c.nanosleep(&ts, null);
+            _ = State.completed.fetchAdd(1, .monotonic);
+        }
+    }.slow_await;
+    const mock_io = std.Io{ .userdata = null, .vtable = &mock_vt };
+
+    var sched = try Scheduler.init(testing.allocator, 1);
+    defer sched.deinit();
+
+    var res1 = try sched.createFiber(&struct {
+        fn body(ctx: *EffectContext) void {
+            var dummy: DummyFuture = .{};
+            ctx.io.vtable.await(ctx.io.userdata, @ptrCast(&dummy), &.{}, .@"1");
+        }
+    }.body, mock_io, 0);
+    defer res1.fiber.deinit();
+
+    var res2 = try sched.createFiber(&struct {
+        fn body(ctx: *EffectContext) void {
+            var dummy: DummyFuture = .{};
+            ctx.io.vtable.await(ctx.io.userdata, @ptrCast(&dummy), &.{}, .@"1");
+        }
+    }.body, mock_io, 0);
+    defer res2.fiber.deinit();
+
+    var handlers = HandlerSet.init(testing.allocator);
+    defer handlers.deinit();
+
+    try sched.spawn(&res1.fiber, res1.handle, &handlers);
+    try sched.spawn(&res2.fiber, res2.handle, &handlers);
+
+    var t_start: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &t_start);
+    sched.run();
+    var t_end: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &t_end);
+    const elapsed_ms = @divFloor(
+        (@as(i64, t_end.sec) - @as(i64, t_start.sec)) * 1_000_000_000 +
+            (@as(i64, t_end.nsec) - @as(i64, t_start.nsec)),
+        1_000_000,
+    );
+
+    try testing.expect(!res1.fiber.isAlive());
+    try testing.expect(!res2.fiber.isAlive());
+    try testing.expectEqual(@as(u32, 2), State.completed.load(.acquire));
+    // Should complete in ~50ms (parallel), not ~100ms (serial). Allow up to 90ms.
+    try testing.expect(elapsed_ms < 90);
+}
+
+test "Scheduler: IO + effects interleaved" {
+    // 1 fiber: perform → IO await → emit. 1 worker. Verify all effects dispatched.
+    const GetVal = types.Perform(void, i32);
+    const Result = types.Emit(i32);
+    const cont_mod = @import("effect/cont.zig");
+
+    const State = struct {
+        var result: i32 = 0;
+    };
+    State.result = 0;
+
+    var mock_vt = makeNoopVtable();
+    mock_vt.await = &struct {
+        fn mock_await(_: ?*anyopaque, _: *std.Io.AnyFuture, _: []u8, _: std.mem.Alignment) void {}
+    }.mock_await;
+    const mock_io = std.Io{ .userdata = null, .vtable = &mock_vt };
+
+    var sched = try Scheduler.init(testing.allocator, 1);
+    defer sched.deinit();
+
+    var res = try sched.createFiber(&struct {
+        fn body(ctx: *EffectContext) void {
+            const val = ctx.perform(GetVal, {});
+            var dummy: DummyFuture = .{};
+            ctx.io.vtable.await(ctx.io.userdata, @ptrCast(&dummy), &.{}, .@"1");
+            ctx.emit(Result, val * 3);
+        }
+    }.body, mock_io, 0);
+    defer res.fiber.deinit();
+
+    var handlers = HandlerSet.init(testing.allocator);
+    defer handlers.deinit();
+    handlers.onPerform(GetVal, &struct {
+        fn handle(_: *GetVal.Value, cont: *cont_mod.Cont(GetVal), _: ?*anyopaque) void {
+            cont.@"resume"(7);
+        }
+    }.handle, null);
+    handlers.onEmit(Result, &struct {
+        fn handle(val: *const Result.Value, _: ?*anyopaque) void {
+            State.result = val.*;
+        }
+    }.handle, null);
+
+    try sched.spawn(&res.fiber, res.handle, &handlers);
+    sched.run();
+
+    try testing.expectEqual(@as(i32, 21), State.result);
+    try testing.expect(!res.fiber.isAlive());
+}
+
+test "Scheduler: multiple IO awaits per fiber" {
+    // 1 fiber does 3 sequential IO awaits. 1 worker. All complete.
+    const State = struct {
+        var await_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+    };
+    State.await_count = std.atomic.Value(u32).init(0);
+
+    var mock_vt = makeNoopVtable();
+    mock_vt.await = &struct {
+        fn counting_await(_: ?*anyopaque, _: *std.Io.AnyFuture, _: []u8, _: std.mem.Alignment) void {
+            _ = State.await_count.fetchAdd(1, .monotonic);
+        }
+    }.counting_await;
+    const mock_io = std.Io{ .userdata = null, .vtable = &mock_vt };
+
+    var sched = try Scheduler.init(testing.allocator, 1);
+    defer sched.deinit();
+
+    var res = try sched.createFiber(&struct {
+        fn body(ctx: *EffectContext) void {
+            for (0..3) |_| {
+                var dummy: DummyFuture = .{};
+                ctx.io.vtable.await(ctx.io.userdata, @ptrCast(&dummy), &.{}, .@"1");
+            }
+        }
+    }.body, mock_io, 0);
+    defer res.fiber.deinit();
+
+    var handlers = HandlerSet.init(testing.allocator);
+    defer handlers.deinit();
+
+    try sched.spawn(&res.fiber, res.handle, &handlers);
+    sched.run();
+
+    try testing.expectEqual(@as(u32, 3), State.await_count.load(.acquire));
+    try testing.expect(!res.fiber.isAlive());
+}
+
+test "Scheduler: IO with multicore" {
+    // 10 fibers × IO await, 4 workers. All complete.
+    const N = 10;
+    const State = struct {
+        var completed: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+    };
+    State.completed = std.atomic.Value(u32).init(0);
+
+    var mock_vt = makeNoopVtable();
+    mock_vt.await = &struct {
+        fn mock_await(_: ?*anyopaque, _: *std.Io.AnyFuture, _: []u8, _: std.mem.Alignment) void {
+            _ = State.completed.fetchAdd(1, .monotonic);
+        }
+    }.mock_await;
+    const mock_io = std.Io{ .userdata = null, .vtable = &mock_vt };
+
+    var sched = try Scheduler.init(testing.allocator, 4);
+    defer sched.deinit();
+
+    var handlers = HandlerSet.init(testing.allocator);
+    defer handlers.deinit();
+
+    var results: [N]FiberResult = undefined;
+    for (0..N) |i| {
+        results[i] = try sched.createFiber(&struct {
+            fn body(ctx: *EffectContext) void {
+                var dummy: DummyFuture = .{};
+                ctx.io.vtable.await(ctx.io.userdata, @ptrCast(&dummy), &.{}, .@"1");
+            }
+        }.body, mock_io, 0);
+        try sched.spawn(&results[i].fiber, results[i].handle, &handlers);
+    }
+
+    sched.run();
+
+    try testing.expectEqual(@as(u32, N), State.completed.load(.acquire));
+    for (0..N) |i| {
+        try testing.expect(!results[i].fiber.isAlive());
+        results[i].fiber.deinit();
+    }
 }
 
 // ============================================================
