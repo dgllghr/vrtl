@@ -12,11 +12,11 @@ pub fn Cont(comptime E: type) type {
     const R = E.Resume;
 
     return struct {
-        fiber: *EffectFiber,
         resume_ptr: ?*anyopaque,
         alive: bool = true,
         delegated: bool = false,
-        next_effect: ?RawEffect = null,
+        resumed: bool = false,
+        dropped: bool = false,
 
         const Self = @This();
 
@@ -27,23 +27,20 @@ pub fn Cont(comptime E: type) type {
         // drop(), or delegate(), the wrapper auto-drops (destroying the
         // fiber).
         //
-        // Handlers may perform blocking or async IO (e.g. via std.Io)
-        // before resuming. The fiber's stack is untouched during this
-        // time — std.Io operates on the handler's own stack. When the
-        // handler's IO completes and it calls resume(), the fiber
-        // continues normally.
+        // resume() and drop() set flags; the erased wrapper (or scheduler)
+        // is responsible for actually resuming/destroying the fiber.
 
         /// Resume the performer, delivering a value.
         pub fn @"resume"(self: *Self, val: R) void {
             if (!self.alive) return;
             self.alive = false;
+            self.resumed = true;
             if (@sizeOf(R) > 0) {
                 if (self.resume_ptr) |ptr| {
                     const slot: *R = @ptrCast(@alignCast(ptr));
                     slot.* = val;
                 }
             }
-            self.next_effect = self.fiber.resumeVoid();
         }
 
         /// Drop the continuation without resuming. The fiber is
@@ -57,7 +54,7 @@ pub fn Cont(comptime E: type) type {
         pub fn drop(self: *Self) void {
             if (!self.alive) return;
             self.alive = false;
-            self.fiber.deinit();
+            self.dropped = true;
         }
 
         /// Delegate the effect to the parent handler scope. The
@@ -65,62 +62,12 @@ pub fn Cont(comptime E: type) type {
         /// The dispatch loop will continue searching parent layers.
         pub fn delegate(self: *Self) void {
             std.debug.assert(self.alive); // can't delegate after resume/drop
+            self.alive = false;
             self.delegated = true;
         }
 
         pub fn isAlive(self: *const Self) bool {
             return self.alive;
-        }
-    };
-}
-
-// ============================================================
-// §3b. SchedulerCont — deferred continuation for effectful handlers
-// ============================================================
-
-pub fn SchedulerCont(comptime E: type) type {
-    const R = E.Resume;
-
-    return struct {
-        resume_ptr: ?*anyopaque,
-        alive: bool = true,
-        delegated: bool = false,
-        resumed: bool = false,
-        dropped: bool = false,
-
-        const Self = @This();
-
-        /// Write the resume value to the origin fiber's stack slot.
-        /// The scheduler resumes the origin fiber after this handler
-        /// fiber completes.
-        pub fn @"resume"(self: *Self, val: R) void {
-            if (!self.alive) return;
-            self.alive = false;
-            self.resumed = true;
-            if (@sizeOf(R) > 0) {
-                if (self.resume_ptr) |ptr| {
-                    const slot: *R = @ptrCast(@alignCast(ptr));
-                    slot.* = val;
-                }
-            }
-        }
-
-        /// Drop the continuation without resuming. The scheduler
-        /// will destroy the origin fiber.
-        pub fn drop(self: *Self) void {
-            if (!self.alive) return;
-            self.alive = false;
-            self.dropped = true;
-        }
-
-        /// Signal that this handler can't handle the effect.
-        /// The scheduler continues searching parent scopes.
-        /// Sets alive = false (unlike Cont.delegate()) to prevent
-        /// contradictory resume/drop after delegate.
-        pub fn delegate(self: *Self) void {
-            std.debug.assert(self.alive);
-            self.alive = false;
-            self.delegated = true;
         }
     };
 }

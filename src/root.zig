@@ -34,7 +34,6 @@ pub const Scheduler = effect.Scheduler;
 
 // Continuations (used in handler signatures)
 pub const Cont = effect.Cont;
-pub const SchedulerCont = effect.SchedulerCont;
 
 // Handler function types (useful for explicit type annotations)
 pub const PerformHandlerFn = effect.PerformHandlerFn;

@@ -10,7 +10,6 @@ const EffectContext = types.EffectContext;
 const effectId = types.effectId;
 
 const Cont = cont_mod.Cont;
-const SchedulerCont = cont_mod.SchedulerCont;
 
 // ============================================================
 // §5. Handler types
@@ -27,7 +26,7 @@ pub fn EmitHandlerFn(comptime E: type) type {
 pub fn EffectfulHandlerFn(comptime E: type) type {
     return *const fn (
         value: *E.Value,
-        cont: *SchedulerCont(E),
+        cont: *Cont(E),
         ctx: *EffectContext,
         user_ctx: ?*anyopaque,
     ) void;
@@ -60,7 +59,7 @@ const EmitBinding = struct {
 pub const HandlerFiberCtx = struct {
     raw: *const RawEffect,
     user_ctx: ?*anyopaque,
-    // Outputs — written by SchedulerCont, read by scheduler
+    // Outputs — written by Cont, read by scheduler
     resumed: bool = false,
     dropped: bool = false,
     delegated: bool = false,
@@ -102,17 +101,14 @@ pub const HandlerSet = struct {
             fn erased(raw: *const RawEffect, fiber: *EffectFiber, user_ctx: ?*anyopaque) PerformResult {
                 const val: *E.Value = @ptrCast(@alignCast(raw.value_ptr));
                 var cont = Cont(E){
-                    .fiber = fiber,
                     .resume_ptr = raw.resume_ptr,
                 };
                 handler(val, &cont, user_ctx);
                 if (cont.delegated) return .skipped;
-                if (cont.alive) {
-                    // Handler returned without resuming, dropping, or delegating.
-                    // Drop the fiber to prevent leaks.
-                    cont.drop();
-                }
-                return .{ .handled = cont.next_effect };
+                if (cont.resumed) return .{ .handled = fiber.resumeVoid() };
+                // dropped or auto-drop
+                fiber.deinit();
+                return .{ .handled = null };
             }
         };
         self.perform_bindings.append(self.allocator, .{
@@ -146,15 +142,15 @@ pub const HandlerSet = struct {
             fn fiber_body(ectx: *EffectContext) void {
                 const hctx = handler_fiber_ctx_tls;
                 const val: *E.Value = @ptrCast(@alignCast(hctx.raw.value_ptr));
-                var sched_cont = SchedulerCont(E){
+                var cont = Cont(E){
                     .resume_ptr = hctx.raw.resume_ptr,
                 };
-                handler(val, &sched_cont, ectx, hctx.user_ctx);
+                handler(val, &cont, ectx, hctx.user_ctx);
                 // Write outcome flags to shared context
-                hctx.resumed = sched_cont.resumed;
-                hctx.dropped = sched_cont.dropped;
-                hctx.delegated = sched_cont.delegated;
-                if (sched_cont.alive and !sched_cont.delegated) {
+                hctx.resumed = cont.resumed;
+                hctx.dropped = cont.dropped;
+                hctx.delegated = cont.delegated;
+                if (cont.alive and !cont.delegated) {
                     hctx.dropped = true; // auto-drop
                 }
             }

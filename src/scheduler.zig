@@ -190,10 +190,10 @@ fn futexWakeAll(ptr: *u32) void {
 }
 
 // ============================================================
-// Park/wake support
+// Suspend/wake support
 // ============================================================
 
-fn doWakePark(wh: *WakeHandle) void {
+fn doWakeSuspend(wh: *WakeHandle) void {
     const entry: *Scheduler.FiberEntry = @ptrFromInt(wh._data[0]);
     const worker: *Worker = @ptrFromInt(wh._data[1]);
     const sched: *Scheduler = @ptrFromInt(wh._data[2]);
@@ -327,7 +327,7 @@ pub const Worker = struct {
 
     /// Process a single fiber entry — dispatch its pending effect.
     /// Performs and emits are dispatched inline in a tight loop.
-    /// Only returns to the main loop on suspend, park, or death.
+    /// Only returns to the main loop on suspend or death.
     fn processEntry(self: *Worker, entry: *FiberEntry) void {
         const sched = self.parent;
 
@@ -380,6 +380,23 @@ pub const Worker = struct {
                     pending_io = null;
                 },
                 .@"suspend" => {
+                    if (eff.id == types.SUSPEND_WAKE) {
+                        // WakeHandle suspend
+                        const wh: *WakeHandle = @ptrCast(@alignCast(eff.value_ptr));
+                        wh._data[0] = @intFromPtr(entry);
+                        wh._data[1] = @intFromPtr(self);
+                        wh._data[2] = @intFromPtr(sched);
+                        wh._wake_fn = &doWakeSuspend;
+                        if (@cmpxchgStrong(u32, &wh.state, WakeHandle.INIT, WakeHandle.PARKED, .acq_rel, .acquire)) |actual| {
+                            if (actual == WakeHandle.WOKEN) {
+                                // Early wake — re-enqueue
+                                entry.pending_effect = .{ .kind = .@"suspend" };
+                                entry.pending_io = null;
+                                self.deque.push(entry) catch unreachable;
+                            }
+                        }
+                        return;
+                    }
                     const pio = entry.pending_io orelse blk: {
                         const tls = pending_io;
                         pending_io = null;
@@ -398,22 +415,6 @@ pub const Worker = struct {
                     captureFiber(entry);
                     entry.pending_io = pending_io;
                     pending_io = null;
-                },
-                .park => {
-                    const wh: *WakeHandle = @ptrCast(@alignCast(eff.value_ptr));
-                    wh._data[0] = @intFromPtr(entry);
-                    wh._data[1] = @intFromPtr(self);
-                    wh._data[2] = @intFromPtr(sched);
-                    wh._wake_fn = &doWakePark;
-                    if (@cmpxchgStrong(u32, &wh.state, WakeHandle.INIT, WakeHandle.PARKED, .acq_rel, .acquire)) |actual| {
-                        if (actual == WakeHandle.WOKEN) {
-                            // Early wake — re-enqueue
-                            entry.pending_effect = .{ .kind = .@"suspend" };
-                            entry.pending_io = null;
-                            self.deque.push(entry) catch unreachable;
-                        }
-                    }
-                    return;
                 },
             }
         }
@@ -618,7 +619,6 @@ pub const Worker = struct {
                                 heff = self.dispatchPerformScheduled(&h, &hfib, hs.parent);
                             },
                             .@"suspend" => unreachable,
-                            .park => unreachable,
                         }
                     }
 
@@ -1348,11 +1348,11 @@ test "Scheduler: IO with multicore" {
 }
 
 // ============================================================
-// Park/wake tests
+// Suspend/wake tests
 // ============================================================
 
 test "Scheduler: early wake resumes immediately" {
-    // Fiber calls wake() before park() — scheduler sees WOKEN, resumes immediately.
+    // Fiber calls wake() before suspend() — scheduler sees WOKEN, resumes immediately.
     const Done = types.Emit(u32);
 
     const State = struct {
@@ -1367,7 +1367,7 @@ test "Scheduler: early wake resumes immediately" {
         fn body(ctx: *EffectContext) void {
             var wh: WakeHandle = .{};
             wh.wake(); // early wake: INIT → WOKEN
-            ctx.park(&wh); // scheduler sees WOKEN → resumes immediately
+            ctx.@"suspend"(&wh); // scheduler sees WOKEN → resumes immediately
             ctx.emit(Done, 42);
         }
     }.body, 0);
@@ -1388,8 +1388,8 @@ test "Scheduler: early wake resumes immediately" {
     try testing.expect(!res.fiber.isAlive());
 }
 
-test "Scheduler: park + wake from another fiber" {
-    // Fiber A parks. Fiber B wakes it (possibly early wake). Fiber A resumes and emits.
+test "Scheduler: suspend + wake from another fiber" {
+    // Fiber A suspends. Fiber B wakes it (possibly early wake). Fiber A resumes and emits.
     const Done = types.Emit(u32);
 
     const Shared = struct {
@@ -1402,10 +1402,10 @@ test "Scheduler: park + wake from another fiber" {
     var sched = try Scheduler.init(testing.allocator, 2);
     defer sched.deinit();
 
-    // Fiber A: park, emit after resume
+    // Fiber A: suspend, emit after resume
     const res_a = try sched.createFiber(&struct {
         fn body(ctx: *EffectContext) void {
-            ctx.park(&Shared.wh);
+            ctx.@"suspend"(&Shared.wh);
             ctx.emit(Done, 99);
         }
     }.body, 0);
@@ -1414,7 +1414,7 @@ test "Scheduler: park + wake from another fiber" {
     // Fiber B: sleep briefly then wake A
     const res_b = try sched.createFiber(&struct {
         fn body(_: *EffectContext) void {
-            // Brief sleep to let scheduler process A's park
+            // Brief sleep to let scheduler process A's suspend
             var ts: std.c.timespec = .{ .sec = 0, .nsec = 5_000_000 }; // 5ms
             _ = std.c.nanosleep(&ts, null);
             Shared.wh.wake();

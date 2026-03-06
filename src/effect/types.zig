@@ -20,7 +20,11 @@ pub fn Emit(comptime T: type) type {
     };
 }
 
-pub const EffectKind = enum(u8) { perform, emit, @"suspend", park };
+pub const EffectKind = enum(u8) { perform, emit, @"suspend" };
+
+/// Sentinel: when RawEffect.id == SUSPEND_WAKE, the suspend is a WakeHandle
+/// park (not an IO suspend). The scheduler checks this to distinguish the two.
+pub const SUSPEND_WAKE: usize = 1;
 
 pub fn effectId(comptime E: type) usize {
     return @intFromPtr(@typeName(E).ptr);
@@ -83,7 +87,7 @@ pub fn initFiberPooled(fiber: *EffectFiber, pool: *@import("../pool.zig").StackP
 }
 
 // ============================================================
-// §3. WakeHandle — park/wake primitive for fibers
+// §3. WakeHandle — suspend/wake primitive for fibers
 // ============================================================
 
 pub const WakeHandle = struct {
@@ -148,9 +152,9 @@ pub const EffectContext = struct {
         });
     }
 
-    /// Park: suspend the fiber until wh.wake() is called.
-    /// The WakeHandle must live on the fiber's stack (frozen while parked).
-    pub fn park(self: *EffectContext, wh: *WakeHandle) void {
-        _ = self.handle.yield(.{ .kind = .park, .value_ptr = @ptrCast(wh) });
+    /// Suspend the fiber until wh.wake() is called.
+    /// The WakeHandle must live on the fiber's stack (frozen while suspended).
+    pub fn @"suspend"(self: *EffectContext, wh: *WakeHandle) void {
+        _ = self.handle.yield(.{ .kind = .@"suspend", .id = SUSPEND_WAKE, .value_ptr = @ptrCast(wh) });
     }
 };

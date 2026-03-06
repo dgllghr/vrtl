@@ -54,7 +54,6 @@ pub fn run(fib: *EffectFiber, handlers: *const HandlerSet) void {
                 maybe_eff = dispatchPerform(&eff, fib, handlers);
             },
             .@"suspend" => unreachable, // suspend is only valid inside Scheduler
-            .park => unreachable, // park is only valid inside Scheduler
         }
     }
 }

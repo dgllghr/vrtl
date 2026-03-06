@@ -29,7 +29,6 @@ pub const EffectContext = types.EffectContext;
 pub const WakeHandle = types.WakeHandle;
 
 pub const Cont = cont_mod.Cont;
-pub const SchedulerCont = cont_mod.SchedulerCont;
 
 pub const PerformHandlerFn = handler_mod.PerformHandlerFn;
 pub const EmitHandlerFn = handler_mod.EmitHandlerFn;
@@ -503,7 +502,7 @@ test "scheduler: effectful handler re-performs effect" {
     var child_hs = HandlerSet.init(testing.allocator);
     defer child_hs.deinit();
     child_hs.onPerformEffect(Lookup, &struct {
-        fn handle(_: *Lookup.Value, cont: *SchedulerCont(Lookup), ectx: *EffectContext, _: ?*anyopaque) void {
+        fn handle(_: *Lookup.Value, cont: *Cont(Lookup), ectx: *EffectContext, _: ?*anyopaque) void {
             const result = ectx.perform(Lookup, "key");
             cont.@"resume"(result);
         }
@@ -549,7 +548,7 @@ test "scheduler: pre/post work around re-perform" {
     var child_hs = HandlerSet.init(testing.allocator);
     defer child_hs.deinit();
     child_hs.onPerformEffect(Lookup, &struct {
-        fn handle(_: *Lookup.Value, cont: *SchedulerCont(Lookup), ectx: *EffectContext, _: ?*anyopaque) void {
+        fn handle(_: *Lookup.Value, cont: *Cont(Lookup), ectx: *EffectContext, _: ?*anyopaque) void {
             ectx.emit(LogEvent, "before");
             const result = ectx.perform(Lookup, "key");
             ectx.emit(LogEvent, "after");
@@ -598,7 +597,7 @@ test "scheduler: effectful handler transforms result" {
     var child_hs = HandlerSet.init(testing.allocator);
     defer child_hs.deinit();
     child_hs.onPerformEffect(Lookup, &struct {
-        fn handle(_: *Lookup.Value, cont: *SchedulerCont(Lookup), ectx: *EffectContext, _: ?*anyopaque) void {
+        fn handle(_: *Lookup.Value, cont: *Cont(Lookup), ectx: *EffectContext, _: ?*anyopaque) void {
             const result = ectx.perform(Lookup, "key");
             cont.@"resume"(result * 2);
         }
@@ -635,7 +634,7 @@ test "scheduler: effectful handler drops origin" {
     var handlers = HandlerSet.init(testing.allocator);
     defer handlers.deinit();
     handlers.onPerformEffect(Abort, &struct {
-        fn handle(_: *Abort.Value, cont: *SchedulerCont(Abort), _: *EffectContext, _: ?*anyopaque) void {
+        fn handle(_: *Abort.Value, cont: *Cont(Abort), _: *EffectContext, _: ?*anyopaque) void {
             cont.drop();
         }
     }.handle, null);
@@ -662,7 +661,7 @@ test "scheduler: effectful handler delegates" {
     var child_hs = HandlerSet.init(testing.allocator);
     defer child_hs.deinit();
     child_hs.onPerformEffect(Lookup, &struct {
-        fn handle(_: *Lookup.Value, cont: *SchedulerCont(Lookup), _: *EffectContext, _: ?*anyopaque) void {
+        fn handle(_: *Lookup.Value, cont: *Cont(Lookup), _: *EffectContext, _: ?*anyopaque) void {
             cont.delegate();
         }
     }.handle, null);
@@ -698,7 +697,7 @@ test "scheduler: effectful handler auto-drop" {
     var handlers = HandlerSet.init(testing.allocator);
     defer handlers.deinit();
     handlers.onPerformEffect(Oops, &struct {
-        fn handle(_: *Oops.Value, _: *SchedulerCont(Oops), _: *EffectContext, _: ?*anyopaque) void {
+        fn handle(_: *Oops.Value, _: *Cont(Oops), _: *EffectContext, _: ?*anyopaque) void {
             // Intentionally do nothing — should auto-drop
         }
     }.handle, null);
@@ -741,7 +740,7 @@ test "scheduler: mixed simple and effectful handlers" {
     var middle_hs = HandlerSet.init(testing.allocator);
     defer middle_hs.deinit();
     middle_hs.onPerformEffect(Lookup, &struct {
-        fn handle(_: *Lookup.Value, cont: *SchedulerCont(Lookup), ectx: *EffectContext, _: ?*anyopaque) void {
+        fn handle(_: *Lookup.Value, cont: *Cont(Lookup), ectx: *EffectContext, _: ?*anyopaque) void {
             const result = ectx.perform(Lookup, "key");
             cont.@"resume"(result * 2);
         }
@@ -781,7 +780,7 @@ test "scheduler: nested effectful handlers" {
     var inner_hs = HandlerSet.init(testing.allocator);
     defer inner_hs.deinit();
     inner_hs.onPerformEffect(Lookup, &struct {
-        fn handle(_: *Lookup.Value, cont: *SchedulerCont(Lookup), ectx: *EffectContext, _: ?*anyopaque) void {
+        fn handle(_: *Lookup.Value, cont: *Cont(Lookup), ectx: *EffectContext, _: ?*anyopaque) void {
             const result = ectx.perform(Lookup, "key");
             cont.@"resume"(result + 10);
         }
@@ -791,7 +790,7 @@ test "scheduler: nested effectful handlers" {
     var outer_hs = HandlerSet.init(testing.allocator);
     defer outer_hs.deinit();
     outer_hs.onPerformEffect(Lookup, &struct {
-        fn handle(_: *Lookup.Value, cont: *SchedulerCont(Lookup), ectx: *EffectContext, _: ?*anyopaque) void {
+        fn handle(_: *Lookup.Value, cont: *Cont(Lookup), ectx: *EffectContext, _: ?*anyopaque) void {
             const result = ectx.perform(Lookup, "key");
             cont.@"resume"(result);
         }
@@ -878,7 +877,7 @@ test "scheduler: effectful handler emits to parent observers" {
     var child_hs = HandlerSet.init(testing.allocator);
     defer child_hs.deinit();
     child_hs.onPerformEffect(Lookup, &struct {
-        fn handle(_: *Lookup.Value, cont: *SchedulerCont(Lookup), ectx: *EffectContext, _: ?*anyopaque) void {
+        fn handle(_: *Lookup.Value, cont: *Cont(Lookup), ectx: *EffectContext, _: ?*anyopaque) void {
             ectx.emit(Trace, "handling lookup");
             const result = ectx.perform(Lookup, "key");
             ectx.emit(Trace, "got result");

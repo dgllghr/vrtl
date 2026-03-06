@@ -12,7 +12,6 @@ const EffectFiber = types.EffectFiber;
 const EffectContext = types.EffectContext;
 const HandlerSet = handler_mod.HandlerSet;
 const Cont = cont_mod.Cont;
-const SchedulerCont = cont_mod.SchedulerCont;
 
 const BenchEmit = types.Emit(u64);
 const BenchPerform = types.Perform(u64, u64);
@@ -259,7 +258,7 @@ fn benchEffectfulPerform(iters: usize) u64 {
 
     var handlers = HandlerSet.init(allocator);
     handlers.onPerformEffect(BenchPerform, &struct {
-        fn handle(_: *BenchPerform.Value, cont: *SchedulerCont(BenchPerform), _: *EffectContext, _: ?*anyopaque) void {
+        fn handle(_: *BenchPerform.Value, cont: *Cont(BenchPerform), _: *EffectContext, _: ?*anyopaque) void {
             cont.@"resume"(42);
         }
     }.handle, null);
