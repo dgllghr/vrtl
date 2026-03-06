@@ -31,8 +31,7 @@ pub fn dispatchPerform(eff: *const RawEffect, fiber: *EffectFiber, handlers: *co
 
 /// Walk the entire handler chain, calling ALL matching emit observers at
 /// every level. Child-level observers run first, then parent, then grandparent.
-pub fn dispatchEmit(eff: *const RawEffect, fiber: *EffectFiber, handlers: *const HandlerSet) void {
-    _ = fiber;
+pub fn dispatchEmit(eff: *const RawEffect, handlers: *const HandlerSet) void {
     var level: ?*const HandlerSet = handlers;
     while (level) |hs| : (level = hs.parent) {
         for (hs.emit_bindings.items) |binding| {
@@ -48,13 +47,13 @@ pub fn run(fib: *EffectFiber, handlers: *const HandlerSet) void {
     while (maybe_eff) |eff| {
         switch (eff.kind) {
             .emit => {
-                dispatchEmit(&eff, fib, handlers);
+                dispatchEmit(&eff, handlers);
                 maybe_eff = fib.resumeVoid();
             },
             .perform => {
                 maybe_eff = dispatchPerform(&eff, fib, handlers);
             },
-            .io_wait => unreachable, // io_wait is only valid inside Scheduler
+            .@"suspend" => unreachable, // suspend is only valid inside Scheduler
             .park => unreachable, // park is only valid inside Scheduler
         }
     }

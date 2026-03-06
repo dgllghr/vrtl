@@ -20,7 +20,7 @@ pub fn Emit(comptime T: type) type {
     };
 }
 
-pub const EffectKind = enum(u8) { perform, emit, io_wait, park };
+pub const EffectKind = enum(u8) { perform, emit, @"suspend", park };
 
 pub fn effectId(comptime E: type) usize {
     return @intFromPtr(@typeName(E).ptr);
@@ -37,6 +37,8 @@ pub const RawEffect = struct {
     /// For perform: pointer to the resume slot on the performer's
     /// stack frame. The continuation writes the resume value here.
     resume_ptr: ?*anyopaque = null,
+    /// For emit: size of the value (needed for heap-copying in async dispatch).
+    value_size: usize = 0,
 };
 
 pub const EffectFiber = fiber_mod.Fiber(RawEffect, void);
@@ -134,8 +136,8 @@ pub const EffectContext = struct {
         return result;
     }
 
-    /// Emit: yield to observers, then resume. Synchronous from
-    /// the fiber's perspective — returns once all observers run.
+    /// Emit: yield to the scheduler which dispatches observers asynchronously.
+    /// The emitting fiber resumes immediately; observers run in separate fibers.
     pub fn emit(self: *EffectContext, comptime E: type, val: E.Value) void {
         comptime std.debug.assert(E.kind == .emit);
         var storage: E.Value = val;
@@ -143,6 +145,7 @@ pub const EffectContext = struct {
             .id = effectId(E),
             .kind = .emit,
             .value_ptr = @ptrCast(&storage),
+            .value_size = @sizeOf(E.Value),
         });
     }
 

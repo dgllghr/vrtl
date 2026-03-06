@@ -50,6 +50,24 @@ threadlocal var original_net_write_fn: *const NetWriteFn = undefined;
 /// Threadlocal for passing IO args from interceptAwait to the scheduler.
 threadlocal var pending_io: ?PendingIo = null;
 
+/// Threadlocal for passing emit observer context from processEntry to the observer body.
+const EmitObserverInfo = struct {
+    id: usize,
+    value_ptr: *anyopaque,
+    handlers: *const HandlerSet,
+};
+threadlocal var emit_observer_info: EmitObserverInfo = undefined;
+
+fn emitObserverBody(ectx: *EffectContext) void {
+    const info = emit_observer_info;
+    _ = ectx.handle.yield(.{ .kind = .@"suspend" });
+    const eff = RawEffect{ .id = info.id, .kind = .emit, .value_ptr = info.value_ptr, .value_size = 0 };
+    dispatch_mod.dispatchEmit(&eff, info.handlers);
+    // value_buf is freed by the scheduler in the dead-fiber cleanup path,
+    // not here — calling free() on a coroutine's small stack can overflow
+    // with debug allocators.
+}
+
 fn interceptAwait(userdata: ?*anyopaque, future: *std.Io.AnyFuture, result_buf: []u8, alignment: std.mem.Alignment) void {
     const handle = active_fiber_handle orelse @panic("interceptAwait called without active fiber handle");
     const Ctx = struct {
@@ -65,7 +83,7 @@ fn interceptAwait(userdata: ?*anyopaque, future: *std.Io.AnyFuture, result_buf: 
     };
     var ctx = Ctx{ .ud = userdata, .fut = future, .buf = result_buf, .align_ = alignment, .orig = original_await_fn };
     pending_io = .{ .run_fn = &Ctx.run, .ctx = @ptrCast(&ctx) };
-    _ = handle.yield(.{ .kind = .io_wait });
+    _ = handle.yield(.{ .kind = .@"suspend" });
 }
 
 fn interceptCancel(userdata: ?*anyopaque, future: *std.Io.AnyFuture, result_buf: []u8, alignment: std.mem.Alignment) void {
@@ -87,7 +105,7 @@ fn interceptNetAccept(userdata: ?*anyopaque, server_handle: net.Socket.Handle) n
     };
     var ctx = Ctx{ .ud = userdata, .hnd = server_handle, .orig = original_net_accept_fn };
     pending_io = .{ .run_fn = &Ctx.run, .ctx = @ptrCast(&ctx) };
-    _ = h.yield(.{ .kind = .io_wait });
+    _ = h.yield(.{ .kind = .@"suspend" });
     return ctx.result;
 }
 
@@ -106,7 +124,7 @@ fn interceptNetRead(userdata: ?*anyopaque, src: net.Socket.Handle, data: [][]u8)
     };
     var ctx = Ctx{ .ud = userdata, .hnd = src, .data = data, .orig = original_net_read_fn };
     pending_io = .{ .run_fn = &Ctx.run, .ctx = @ptrCast(&ctx) };
-    _ = h.yield(.{ .kind = .io_wait });
+    _ = h.yield(.{ .kind = .@"suspend" });
     return ctx.result;
 }
 
@@ -127,7 +145,7 @@ fn interceptNetWrite(userdata: ?*anyopaque, dest: net.Socket.Handle, header: []c
     };
     var ctx = Ctx{ .ud = userdata, .hnd = dest, .header = header, .data = data, .splat = splat, .orig = original_net_write_fn };
     pending_io = .{ .run_fn = &Ctx.run, .ctx = @ptrCast(&ctx) };
-    _ = h.yield(.{ .kind = .io_wait });
+    _ = h.yield(.{ .kind = .@"suspend" });
     return ctx.result;
 }
 
@@ -181,7 +199,7 @@ fn doWakePark(wh: *WakeHandle) void {
     const entry: *Scheduler.FiberEntry = @ptrFromInt(wh._data[0]);
     const worker: *Worker = @ptrFromInt(wh._data[1]);
     const sched: *Scheduler = @ptrFromInt(wh._data[2]);
-    entry.pending_effect = .{ .kind = .io_wait };
+    entry.pending_effect = .{ .kind = .@"suspend" };
     entry.pending_io = null;
     worker.inbox.push(sched.allocator, entry);
     // Unconditional store avoids missed wakeup when worker is still RUNNING:
@@ -251,6 +269,11 @@ pub const Worker = struct {
     fn deinitWorker(self: *Worker) void {
         self.pool.deinit();
         while (self.deque.pop()) |entry| {
+            if (entry.owns_fiber) {
+                entry.fiber.deinit();
+                self.parent.allocator.destroy(entry.fiber);
+            }
+            if (entry.emit_value_buf) |buf| self.parent.allocator.free(buf);
             self.parent.allocator.destroy(entry);
         }
         self.deque.deinit();
@@ -293,15 +316,44 @@ pub const Worker = struct {
                     self.deque.push(entry) catch unreachable;
                 },
                 .emit => {
-                    dispatch_mod.dispatchEmit(&eff, entry.fiber, entry.handlers);
+                    // Heap-copy emit value (emitting fiber's stack becomes invalid after resume)
+                    const value_size = eff.value_size;
+                    const value_copy = sched.allocator.alloc(u8, value_size) catch @panic("OOM");
+                    @memcpy(value_copy, @as([*]const u8, @ptrCast(eff.value_ptr))[0..value_size]);
+
+                    // Create observer fiber via TLS pattern
+                    emit_observer_info = .{
+                        .id = eff.id,
+                        .value_ptr = @ptrCast(value_copy.ptr),
+                        .handlers = entry.handlers,
+                    };
+                    const obs_fiber_ptr = sched.allocator.create(EffectFiber) catch @panic("OOM");
+                    obs_fiber_ptr.* = initFiberPooled(&self.pool, &emitObserverBody) catch @panic("OOM");
+                    const obs_start = obs_fiber_ptr.start(); // captures TLS, yields .suspend
+
+                    const obs_entry = sched.allocator.create(FiberEntry) catch @panic("OOM");
+                    obs_entry.* = .{
+                        .fiber = obs_fiber_ptr,
+                        .handlers = entry.handlers,
+                        .handle = null,
+                        .pending_effect = obs_start,
+                        .owns_fiber = true,
+                        .emit_value_buf = value_copy,
+                    };
+
+                    // Resume emitting fiber immediately
                     activateFiber(entry);
                     entry.pending_effect = entry.fiber.resumeVoid();
                     captureFiber(entry);
                     entry.pending_io = pending_io;
                     pending_io = null;
+
+                    // Push observer first (stealable), then emitting fiber (LIFO = runs next)
+                    self.deque.push(obs_entry) catch unreachable;
                     self.deque.push(entry) catch unreachable;
+                    _ = @atomicRmw(isize, &sched.live_fibers, .Add, 1, .monotonic);
                 },
-                .io_wait => {
+                .@"suspend" => {
                     // Check entry first (captured in start phase), then TLS
                     const pio = entry.pending_io orelse blk: {
                         const tls = pending_io;
@@ -334,7 +386,7 @@ pub const Worker = struct {
                     if (@cmpxchgStrong(u32, &wh.state, WakeHandle.INIT, WakeHandle.PARKED, .acq_rel, .acquire)) |actual| {
                         if (actual == WakeHandle.WOKEN) {
                             // Early wake — resume immediately
-                            entry.pending_effect = .{ .kind = .io_wait };
+                            entry.pending_effect = .{ .kind = .@"suspend" };
                             entry.pending_io = null;
                             self.deque.push(entry) catch unreachable;
                         }
@@ -358,7 +410,12 @@ pub const Worker = struct {
             self.deque.push(entry) catch unreachable;
             sched.wakeOne(self);
         } else {
-            // Fiber is dead — free the entry, decrement live count
+            // Fiber is dead — clean up, decrement live count
+            if (entry.owns_fiber) {
+                entry.fiber.deinit();
+                sched.allocator.destroy(entry.fiber);
+            }
+            if (entry.emit_value_buf) |buf| sched.allocator.free(buf);
             sched.allocator.destroy(entry);
             const prev = @atomicRmw(isize, &sched.live_fibers, .Sub, 1, .release);
             if (prev <= 1) {
@@ -402,7 +459,7 @@ pub const Worker = struct {
                 const io = e.pending_io.?;
                 io.run_fn(io.ctx);
                 e.pending_io = null;
-                e.pending_effect = .{ .kind = .io_wait };
+                e.pending_effect = .{ .kind = .@"suspend" };
                 w.inbox.push(s.allocator, e);
                 if (@cmpxchgStrong(u32, &w.park_state, PARK_PARKED, PARK_NOTIFIED, .release, .monotonic) == null) {
                     futexWakeOne(&w.park_state);
@@ -548,14 +605,14 @@ pub const Worker = struct {
                         switch (h.kind) {
                             .emit => {
                                 if (hs.parent) |p| {
-                                    dispatch_mod.dispatchEmit(&h, &hfib, p);
+                                    dispatch_mod.dispatchEmit(&h, p);
                                 }
                                 heff = hfib.resumeVoid();
                             },
                             .perform => {
                                 heff = self.dispatchPerformScheduled(&h, &hfib, hs.parent);
                             },
-                            .io_wait => unreachable,
+                            .@"suspend" => unreachable,
                             .park => unreachable,
                         }
                     }
@@ -614,6 +671,8 @@ pub const Scheduler = struct {
         handle: ?*EffectFiber.Handle,
         pending_effect: ?RawEffect,
         pending_io: ?PendingIo = null,
+        owns_fiber: bool = false,
+        emit_value_buf: ?[]u8 = null,
     };
 
     /// Initialize a scheduler with `num_workers` workers.
@@ -710,7 +769,7 @@ pub const Scheduler = struct {
                 const io = Static.current_io;
                 active_fiber_handle = h;
                 var ctx = EffectContext.initWithIo(h, io);
-                _ = h.yield(.{ .kind = .io_wait });
+                _ = h.yield(.{ .kind = .@"suspend" });
                 b(&ctx);
             }
         }.wrapper, stack_size, &self.workers[0].pool);
@@ -845,6 +904,8 @@ test "Scheduler: single fiber yields on await then completes" {
 }
 
 test "Scheduler: two fibers LIFO depth-first" {
+    // With async emit, observer fibers run independently so cross-fiber ordering
+    // is non-deterministic. Verify all 4 emit values appear (count-based).
 
     const State = struct {
         var order: [8]u8 = .{0} ** 8;
@@ -903,14 +964,15 @@ test "Scheduler: two fibers LIFO depth-first" {
     try testing.expect(!res1.fiber.isAlive());
     try testing.expect(!res2.fiber.isAlive());
 
-    // LIFO: last-spawned fiber (res2) runs depth-first to completion,
-    // then res1 runs. Within each fiber, order is preserved.
+    // All 4 emit values should appear (order is non-deterministic with async emit)
     const trace = State.order[0..State.idx];
     try testing.expectEqual(@as(usize, 4), trace.len);
-    try testing.expectEqual(@as(u8, '1'), trace[0]);
-    try testing.expectEqual(@as(u8, '2'), trace[1]);
-    try testing.expectEqual(@as(u8, 'A'), trace[2]);
-    try testing.expectEqual(@as(u8, 'B'), trace[3]);
+    var counts = [_]u8{0} ** 256;
+    for (trace) |c| counts[c] += 1;
+    try testing.expectEqual(@as(u8, 1), counts['A']);
+    try testing.expectEqual(@as(u8, 1), counts['B']);
+    try testing.expectEqual(@as(u8, 1), counts['1']);
+    try testing.expectEqual(@as(u8, 1), counts['2']);
 }
 
 test "Scheduler: IO combined with algebraic effects" {
