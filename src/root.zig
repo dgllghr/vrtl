@@ -18,6 +18,7 @@ pub const Emit = effect.Emit;
 
 // Context for effectful fiber bodies
 pub const EffectContext = effect.EffectContext;
+pub const WakeHandle = effect.WakeHandle;
 
 // Fiber creation
 pub const initFiber = effect.initFiber;

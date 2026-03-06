@@ -20,7 +20,7 @@ pub fn Emit(comptime T: type) type {
     };
 }
 
-pub const EffectKind = enum(u8) { perform, emit, io_wait };
+pub const EffectKind = enum(u8) { perform, emit, io_wait, park };
 
 pub fn effectId(comptime E: type) usize {
     return @intFromPtr(@typeName(E).ptr);
@@ -82,6 +82,29 @@ pub fn initFiberPooled(pool: *@import("../pool.zig").StackPool, body: EffectBody
 }
 
 // ============================================================
+// §3. WakeHandle — park/wake primitive for fibers
+// ============================================================
+
+pub const WakeHandle = struct {
+    _data: [3]usize = .{ 0, 0, 0 },
+    _wake_fn: ?*const fn (*WakeHandle) void = null,
+    state: u32 = INIT,
+
+    pub const INIT: u32 = 0;
+    pub const PARKED: u32 = 1;
+    pub const WOKEN: u32 = 2;
+
+    /// Re-enqueue the parked fiber. Safe to call from any fiber or thread.
+    /// No-op if already woken. Handles early wake (called before park is processed).
+    pub fn wake(self: *WakeHandle) void {
+        const prev = @atomicRmw(u32, &self.state, .Xchg, WOKEN, .acq_rel);
+        if (prev == PARKED) {
+            self._wake_fn.?(self);
+        }
+    }
+};
+
+// ============================================================
 // §4. EffectContext — used inside effectful fiber bodies
 // ============================================================
 
@@ -121,5 +144,11 @@ pub const EffectContext = struct {
             .kind = .emit,
             .value_ptr = @ptrCast(&storage),
         });
+    }
+
+    /// Park: suspend the fiber until wh.wake() is called.
+    /// The WakeHandle must live on the fiber's stack (frozen while parked).
+    pub fn park(self: *EffectContext, wh: *WakeHandle) void {
+        _ = self.handle.yield(.{ .kind = .park, .value_ptr = @ptrCast(wh) });
     }
 };

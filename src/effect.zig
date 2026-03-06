@@ -26,6 +26,7 @@ pub const EffectBodyFn = types.EffectBodyFn;
 pub const initFiber = types.initFiber;
 pub const initFiberDefault = types.initFiberDefault;
 pub const EffectContext = types.EffectContext;
+pub const WakeHandle = types.WakeHandle;
 
 pub const Cont = cont_mod.Cont;
 pub const SchedulerCont = cont_mod.SchedulerCont;
