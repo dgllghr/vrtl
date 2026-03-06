@@ -30,9 +30,9 @@ pub const WakeHandle = types.WakeHandle;
 
 pub const Cont = cont_mod.Cont;
 
-pub const PerformHandlerFn = handler_mod.PerformHandlerFn;
+pub const PerformSyncHandlerFn = handler_mod.PerformSyncHandlerFn;
 pub const EmitHandlerFn = handler_mod.EmitHandlerFn;
-pub const EffectfulHandlerFn = handler_mod.EffectfulHandlerFn;
+pub const PerformHandlerFn = handler_mod.PerformHandlerFn;
 pub const HandlerSet = handler_mod.HandlerSet;
 
 pub const run = dispatch_mod.run;
@@ -72,7 +72,7 @@ test "perform: handler resumes with a value" {
     var handlers = HandlerSet.init(testing.allocator);
     defer handlers.deinit();
 
-    handlers.onPerform(GetInt, &struct {
+    handlers.onPerformSync(GetInt, &struct {
         fn handle(_: *GetInt.Value, cont: *Cont(GetInt), _: ?*anyopaque) void {
             cont.@"resume"(42);
         }
@@ -139,7 +139,7 @@ test "mixed perform and emit" {
     var handlers = HandlerSet.init(testing.allocator);
     defer handlers.deinit();
 
-    handlers.onPerform(Add, &struct {
+    handlers.onPerformSync(Add, &struct {
         fn handle(val: *Add.Value, cont: *Cont(Add), _: ?*anyopaque) void {
             cont.@"resume"(val.* + 5);
         }
@@ -172,7 +172,7 @@ test "perform handler can drop continuation" {
     var handlers = HandlerSet.init(testing.allocator);
     defer handlers.deinit();
 
-    handlers.onPerform(Abort, &struct {
+    handlers.onPerformSync(Abort, &struct {
         fn handle(_: *Abort.Value, cont: *Cont(Abort), _: ?*anyopaque) void {
             cont.drop();
         }
@@ -198,7 +198,7 @@ test "auto-drop when handler forgets to resume" {
     var handlers = HandlerSet.init(testing.allocator);
     defer handlers.deinit();
 
-    handlers.onPerform(Oops, &struct {
+    handlers.onPerformSync(Oops, &struct {
         fn handle(_: *Oops.Value, _: *Cont(Oops), _: ?*anyopaque) void {
             // Intentionally do nothing — should auto-drop.
         }
@@ -283,7 +283,7 @@ test "child delegates perform to parent" {
     // Child: delegates everything
     var child = HandlerSet.init(testing.allocator);
     defer child.deinit();
-    child.onPerform(Fetch, &struct {
+    child.onPerformSync(Fetch, &struct {
         fn handle(_: *Fetch.Value, cont: *Cont(Fetch), _: ?*anyopaque) void {
             cont.delegate();
         }
@@ -292,7 +292,7 @@ test "child delegates perform to parent" {
     // Parent: handles with 99
     var parent = HandlerSet.init(testing.allocator);
     defer parent.deinit();
-    parent.onPerform(Fetch, &struct {
+    parent.onPerformSync(Fetch, &struct {
         fn handle(_: *Fetch.Value, cont: *Cont(Fetch), _: ?*anyopaque) void {
             cont.@"resume"(99);
         }
@@ -325,7 +325,7 @@ test "conditional delegation (cache pattern)" {
     // Child: cache layer — handles "cached", delegates others
     var cache = HandlerSet.init(testing.allocator);
     defer cache.deinit();
-    cache.onPerform(Lookup, &struct {
+    cache.onPerformSync(Lookup, &struct {
         fn handle(key: *Lookup.Value, cont: *Cont(Lookup), _: ?*anyopaque) void {
             if (std.mem.eql(u8, key.*, "cached")) {
                 cont.@"resume"(10); // cache hit
@@ -346,7 +346,7 @@ test "conditional delegation (cache pattern)" {
     // Parent: DB layer — always returns 42
     var db = HandlerSet.init(testing.allocator);
     defer db.deinit();
-    db.onPerform(Lookup, &struct {
+    db.onPerformSync(Lookup, &struct {
         fn handle(_: *Lookup.Value, cont: *Cont(Lookup), _: ?*anyopaque) void {
             cont.@"resume"(42); // DB result
         }
@@ -414,7 +414,7 @@ test "three-level delegation chain" {
     // Level 1 (innermost): delegates
     var l1 = HandlerSet.init(testing.allocator);
     defer l1.deinit();
-    l1.onPerform(Ask, &struct {
+    l1.onPerformSync(Ask, &struct {
         fn handle(_: *Ask.Value, cont: *Cont(Ask), _: ?*anyopaque) void {
             cont.delegate();
         }
@@ -423,7 +423,7 @@ test "three-level delegation chain" {
     // Level 2 (middle): also delegates
     var l2 = HandlerSet.init(testing.allocator);
     defer l2.deinit();
-    l2.onPerform(Ask, &struct {
+    l2.onPerformSync(Ask, &struct {
         fn handle(_: *Ask.Value, cont: *Cont(Ask), _: ?*anyopaque) void {
             cont.delegate();
         }
@@ -432,7 +432,7 @@ test "three-level delegation chain" {
     // Level 3 (outermost): handles
     var l3 = HandlerSet.init(testing.allocator);
     defer l3.deinit();
-    l3.onPerform(Ask, &struct {
+    l3.onPerformSync(Ask, &struct {
         fn handle(_: *Ask.Value, cont: *Cont(Ask), _: ?*anyopaque) void {
             cont.@"resume"(77);
         }
@@ -460,7 +460,7 @@ test "auto-drop preserved with delegation in chain" {
     // Child: delegates
     var child = HandlerSet.init(testing.allocator);
     defer child.deinit();
-    child.onPerform(Oops, &struct {
+    child.onPerformSync(Oops, &struct {
         fn handle(_: *Oops.Value, cont: *Cont(Oops), _: ?*anyopaque) void {
             cont.delegate();
         }
@@ -469,7 +469,7 @@ test "auto-drop preserved with delegation in chain" {
     // Parent: forgets to resume/drop — should auto-drop
     var parent = HandlerSet.init(testing.allocator);
     defer parent.deinit();
-    parent.onPerform(Oops, &struct {
+    parent.onPerformSync(Oops, &struct {
         fn handle(_: *Oops.Value, _: *Cont(Oops), _: ?*anyopaque) void {
             // Intentionally do nothing — should auto-drop.
         }
@@ -501,7 +501,7 @@ test "scheduler: effectful handler re-performs effect" {
     // Child: effectful handler that re-performs
     var child_hs = HandlerSet.init(testing.allocator);
     defer child_hs.deinit();
-    child_hs.onPerformEffect(Lookup, &struct {
+    child_hs.onPerform(Lookup, &struct {
         fn handle(_: *Lookup.Value, cont: *Cont(Lookup), ectx: *EffectContext, _: ?*anyopaque) void {
             const result = ectx.perform(Lookup, "key");
             cont.@"resume"(result);
@@ -511,7 +511,7 @@ test "scheduler: effectful handler re-performs effect" {
     // Parent: simple handler returns 42
     var parent_hs = HandlerSet.init(testing.allocator);
     defer parent_hs.deinit();
-    parent_hs.onPerform(Lookup, &struct {
+    parent_hs.onPerformSync(Lookup, &struct {
         fn handle(_: *Lookup.Value, cont: *Cont(Lookup), _: ?*anyopaque) void {
             cont.@"resume"(42);
         }
@@ -547,7 +547,7 @@ test "scheduler: pre/post work around re-perform" {
     // Effectful handler: emits before and after re-perform
     var child_hs = HandlerSet.init(testing.allocator);
     defer child_hs.deinit();
-    child_hs.onPerformEffect(Lookup, &struct {
+    child_hs.onPerform(Lookup, &struct {
         fn handle(_: *Lookup.Value, cont: *Cont(Lookup), ectx: *EffectContext, _: ?*anyopaque) void {
             ectx.emit(LogEvent, "before");
             const result = ectx.perform(Lookup, "key");
@@ -559,7 +559,7 @@ test "scheduler: pre/post work around re-perform" {
     // Parent: handles Lookup and observes LogEvent
     var parent_hs = HandlerSet.init(testing.allocator);
     defer parent_hs.deinit();
-    parent_hs.onPerform(Lookup, &struct {
+    parent_hs.onPerformSync(Lookup, &struct {
         fn handle(_: *Lookup.Value, cont: *Cont(Lookup), _: ?*anyopaque) void {
             cont.@"resume"(42);
         }
@@ -596,7 +596,7 @@ test "scheduler: effectful handler transforms result" {
 
     var child_hs = HandlerSet.init(testing.allocator);
     defer child_hs.deinit();
-    child_hs.onPerformEffect(Lookup, &struct {
+    child_hs.onPerform(Lookup, &struct {
         fn handle(_: *Lookup.Value, cont: *Cont(Lookup), ectx: *EffectContext, _: ?*anyopaque) void {
             const result = ectx.perform(Lookup, "key");
             cont.@"resume"(result * 2);
@@ -605,7 +605,7 @@ test "scheduler: effectful handler transforms result" {
 
     var parent_hs = HandlerSet.init(testing.allocator);
     defer parent_hs.deinit();
-    parent_hs.onPerform(Lookup, &struct {
+    parent_hs.onPerformSync(Lookup, &struct {
         fn handle(_: *Lookup.Value, cont: *Cont(Lookup), _: ?*anyopaque) void {
             cont.@"resume"(42);
         }
@@ -633,7 +633,7 @@ test "scheduler: effectful handler drops origin" {
 
     var handlers = HandlerSet.init(testing.allocator);
     defer handlers.deinit();
-    handlers.onPerformEffect(Abort, &struct {
+    handlers.onPerform(Abort, &struct {
         fn handle(_: *Abort.Value, cont: *Cont(Abort), _: *EffectContext, _: ?*anyopaque) void {
             cont.drop();
         }
@@ -660,7 +660,7 @@ test "scheduler: effectful handler delegates" {
 
     var child_hs = HandlerSet.init(testing.allocator);
     defer child_hs.deinit();
-    child_hs.onPerformEffect(Lookup, &struct {
+    child_hs.onPerform(Lookup, &struct {
         fn handle(_: *Lookup.Value, cont: *Cont(Lookup), _: *EffectContext, _: ?*anyopaque) void {
             cont.delegate();
         }
@@ -668,7 +668,7 @@ test "scheduler: effectful handler delegates" {
 
     var parent_hs = HandlerSet.init(testing.allocator);
     defer parent_hs.deinit();
-    parent_hs.onPerform(Lookup, &struct {
+    parent_hs.onPerformSync(Lookup, &struct {
         fn handle(_: *Lookup.Value, cont: *Cont(Lookup), _: ?*anyopaque) void {
             cont.@"resume"(99);
         }
@@ -696,7 +696,7 @@ test "scheduler: effectful handler auto-drop" {
 
     var handlers = HandlerSet.init(testing.allocator);
     defer handlers.deinit();
-    handlers.onPerformEffect(Oops, &struct {
+    handlers.onPerform(Oops, &struct {
         fn handle(_: *Oops.Value, _: *Cont(Oops), _: *EffectContext, _: ?*anyopaque) void {
             // Intentionally do nothing — should auto-drop
         }
@@ -726,7 +726,7 @@ test "scheduler: mixed simple and effectful handlers" {
     // Child: simple handler — cache hit for "cached", delegate for miss
     var child_hs = HandlerSet.init(testing.allocator);
     defer child_hs.deinit();
-    child_hs.onPerform(Lookup, &struct {
+    child_hs.onPerformSync(Lookup, &struct {
         fn handle(key: *Lookup.Value, cont: *Cont(Lookup), _: ?*anyopaque) void {
             if (std.mem.eql(u8, key.*, "cached")) {
                 cont.@"resume"(10);
@@ -739,7 +739,7 @@ test "scheduler: mixed simple and effectful handlers" {
     // Middle: effectful handler — intercepts, re-performs to parent, doubles result
     var middle_hs = HandlerSet.init(testing.allocator);
     defer middle_hs.deinit();
-    middle_hs.onPerformEffect(Lookup, &struct {
+    middle_hs.onPerform(Lookup, &struct {
         fn handle(_: *Lookup.Value, cont: *Cont(Lookup), ectx: *EffectContext, _: ?*anyopaque) void {
             const result = ectx.perform(Lookup, "key");
             cont.@"resume"(result * 2);
@@ -749,7 +749,7 @@ test "scheduler: mixed simple and effectful handlers" {
     // Parent: simple handler — always returns 42
     var parent_hs = HandlerSet.init(testing.allocator);
     defer parent_hs.deinit();
-    parent_hs.onPerform(Lookup, &struct {
+    parent_hs.onPerformSync(Lookup, &struct {
         fn handle(_: *Lookup.Value, cont: *Cont(Lookup), _: ?*anyopaque) void {
             cont.@"resume"(42);
         }
@@ -779,7 +779,7 @@ test "scheduler: nested effectful handlers" {
     // Inner effectful: re-performs, adds 10
     var inner_hs = HandlerSet.init(testing.allocator);
     defer inner_hs.deinit();
-    inner_hs.onPerformEffect(Lookup, &struct {
+    inner_hs.onPerform(Lookup, &struct {
         fn handle(_: *Lookup.Value, cont: *Cont(Lookup), ectx: *EffectContext, _: ?*anyopaque) void {
             const result = ectx.perform(Lookup, "key");
             cont.@"resume"(result + 10);
@@ -789,7 +789,7 @@ test "scheduler: nested effectful handlers" {
     // Outer effectful: re-performs, passes through
     var outer_hs = HandlerSet.init(testing.allocator);
     defer outer_hs.deinit();
-    outer_hs.onPerformEffect(Lookup, &struct {
+    outer_hs.onPerform(Lookup, &struct {
         fn handle(_: *Lookup.Value, cont: *Cont(Lookup), ectx: *EffectContext, _: ?*anyopaque) void {
             const result = ectx.perform(Lookup, "key");
             cont.@"resume"(result);
@@ -799,7 +799,7 @@ test "scheduler: nested effectful handlers" {
     // Base: simple handler returns 42
     var base_hs = HandlerSet.init(testing.allocator);
     defer base_hs.deinit();
-    base_hs.onPerform(Lookup, &struct {
+    base_hs.onPerformSync(Lookup, &struct {
         fn handle(_: *Lookup.Value, cont: *Cont(Lookup), _: ?*anyopaque) void {
             cont.@"resume"(42);
         }
@@ -834,7 +834,7 @@ test "scheduler: simple-only handlers match run() behavior" {
     var handlers = HandlerSet.init(testing.allocator);
     defer handlers.deinit();
 
-    handlers.onPerform(GetInt, &struct {
+    handlers.onPerformSync(GetInt, &struct {
         fn handle(_: *GetInt.Value, cont: *Cont(GetInt), _: ?*anyopaque) void {
             cont.@"resume"(42);
         }
@@ -876,7 +876,7 @@ test "scheduler: effectful handler emits to parent observers" {
     // Child: effectful handler that emits trace events
     var child_hs = HandlerSet.init(testing.allocator);
     defer child_hs.deinit();
-    child_hs.onPerformEffect(Lookup, &struct {
+    child_hs.onPerform(Lookup, &struct {
         fn handle(_: *Lookup.Value, cont: *Cont(Lookup), ectx: *EffectContext, _: ?*anyopaque) void {
             ectx.emit(Trace, "handling lookup");
             const result = ectx.perform(Lookup, "key");
@@ -888,7 +888,7 @@ test "scheduler: effectful handler emits to parent observers" {
     // Parent: handles Lookup and observes Trace
     var parent_hs = HandlerSet.init(testing.allocator);
     defer parent_hs.deinit();
-    parent_hs.onPerform(Lookup, &struct {
+    parent_hs.onPerformSync(Lookup, &struct {
         fn handle(_: *Lookup.Value, cont: *Cont(Lookup), _: ?*anyopaque) void {
             cont.@"resume"(42);
         }

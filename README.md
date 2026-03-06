@@ -7,8 +7,6 @@ ARM64 (Apple Silicon) only for now.
 
 Pure Zig coroutine runtime — no C dependencies. Multicore scheduler with
 N worker threads, per-worker Chase-Lev deques, and futex-based parking.
-Competitive with OCaml 5's effect handler performance (~1.6x faster
-single-threaded effect dispatch, comparable multicore throughput).
 
 ## What it does
 
@@ -47,7 +45,8 @@ const Log = vt.Emit([]const u8);                       // send a message
 ### Writing an effectful fiber
 
 ```zig
-var fib = try vt.initFiberDefault(&struct {
+var fib: vt.EffectFiber = undefined;
+try vt.initFiberDefault(&fib, &struct {
     fn body(ctx: *vt.EffectContext) void {
         const contents = ctx.perform(ReadFile, "config.json");
         ctx.emit(Log, contents);
@@ -58,12 +57,21 @@ defer fib.deinit();
 
 ### Binding handlers
 
+Perform handlers run in their own fiber and receive an `EffectContext`, so they
+can perform and emit effects themselves:
+
 ```zig
 var handlers = vt.HandlerSet.init(allocator);
 defer handlers.deinit();
 
 handlers.onPerform(ReadFile, &struct {
-    fn handle(filename: *ReadFile.Value, cont: *vt.Cont(ReadFile), _: ?*anyopaque) void {
+    fn handle(
+        filename: *ReadFile.Value,
+        cont: *vt.Cont(ReadFile),
+        ctx: *vt.EffectContext,
+        _: ?*anyopaque,
+    ) void {
+        ctx.emit(Log, "reading file");
         // In real code you'd read the file here.
         cont.@"resume"("file contents");
     }
@@ -76,9 +84,21 @@ handlers.onEmit(Log, &struct {
 }.handle, null);
 ```
 
+For handlers that don't need their own fiber (no effects, just
+resume/drop/delegate), use `onPerformSync`:
+
+```zig
+handlers.onPerformSync(ReadFile, &struct {
+    fn handle(filename: *ReadFile.Value, cont: *vt.Cont(ReadFile), _: ?*anyopaque) void {
+        cont.@"resume"("file contents");
+    }
+}.handle, null);
+```
+
 ### Running
 
-For a single fiber:
+For a single fiber (no scheduler, synchronous dispatch — only `onPerformSync`
+handlers):
 
 ```zig
 vt.run(&fib, &handlers);
@@ -87,15 +107,15 @@ vt.run(&fib, &handlers);
 For multiple fibers with IO scheduling:
 
 ```zig
-// 0 = auto-detect CPU count, or pass an explicit worker count
-var sched = try vt.Scheduler.init(allocator, 0);
+var sched = try vt.Scheduler.init(allocator, 4); // 4 worker threads
 defer sched.deinit();
+sched.setIo(io); // optional: integrate with std.Io
 
-var res = try sched.createFiber(&myBody, io, 0);
-defer res.fiber.deinit();
+const entry = try sched.createFiber(&myBody, 0); // 0 = default stack size
+defer sched.destroyFiber(entry);
 
-try sched.spawn(&res.fiber, res.handle, &handlers);
-sched.run();  // distributes fibers across workers, blocks until all complete
+try sched.spawn(entry, &handlers);
+sched.run(); // blocks until all fibers complete
 ```
 
 ### Handler composition
@@ -106,25 +126,61 @@ handle to a parent:
 ```zig
 var cache = vt.HandlerSet.init(allocator);
 cache.onPerform(ReadFile, &struct {
-    fn handle(key: *ReadFile.Value, cont: *vt.Cont(ReadFile), _: ?*anyopaque) void {
+    fn handle(
+        key: *ReadFile.Value,
+        cont: *vt.Cont(ReadFile),
+        ctx: *vt.EffectContext,
+        _: ?*anyopaque,
+    ) void {
         if (std.mem.eql(u8, key.*, "cached.txt")) {
             cont.@"resume"("from cache");
         } else {
-            cont.delegate();  // pass to parent
+            // Re-perform to parent scope
+            const result = ctx.perform(ReadFile, key.*);
+            cont.@"resume"(result);
         }
     }
 }.handle, null);
 
 var db = vt.HandlerSet.init(allocator);
-db.onPerform(ReadFile, &struct {
+db.onPerformSync(ReadFile, &struct {
     fn handle(_: *ReadFile.Value, cont: *vt.Cont(ReadFile), _: ?*anyopaque) void {
         cont.@"resume"("from db");
     }
 }.handle, null);
 
 cache.setParent(&db);
-vt.run(&fib, &cache);
+try sched.spawn(entry, &cache);
 ```
+
+### Suspend / wake
+
+Fibers can suspend until explicitly woken by another fiber or thread:
+
+```zig
+fn body(ctx: *vt.EffectContext) void {
+    var wh: vt.WakeHandle = .{};
+
+    // Pass wh to another fiber/thread, then suspend.
+    // The other side calls wh.wake() to resume this fiber.
+    ctx.@"suspend"(&wh);
+
+    // Continues here after wake.
+}
+```
+
+`wh.wake()` is safe to call from any thread. If called before the scheduler
+processes the suspend, the fiber resumes immediately (early wake).
+
+### Continuation API
+
+The `Cont(E)` type is used in all perform handlers:
+
+- `cont.resume(value)` — deliver a value and resume the performer
+- `cont.drop()` — destroy the fiber without resuming (performer never returns)
+- `cont.delegate()` — pass the effect to the parent handler scope
+
+If the handler returns without calling any of these, the fiber is auto-dropped.
 
 ## Building
 

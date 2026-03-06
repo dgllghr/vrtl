@@ -6,7 +6,7 @@
 //!
 //! Bind handlers and run:
 //!   var handlers = vt.HandlerSet.init(allocator);
-//!   handlers.onPerform(Write, &writeHandler, null);
+//!   handlers.onPerformSync(Write, &writeHandler, null);
 //!   handlers.onEmit(Log, &logHandler, null);
 //!   vt.run(&fiber, &handlers);
 
@@ -36,9 +36,9 @@ pub const Scheduler = effect.Scheduler;
 pub const Cont = effect.Cont;
 
 // Handler function types (useful for explicit type annotations)
-pub const PerformHandlerFn = effect.PerformHandlerFn;
+pub const PerformSyncHandlerFn = effect.PerformSyncHandlerFn;
 pub const EmitHandlerFn = effect.EmitHandlerFn;
-pub const EffectfulHandlerFn = effect.EffectfulHandlerFn;
+pub const PerformHandlerFn = effect.PerformHandlerFn;
 
 // Low-level / advanced
 pub const EffectFiber = effect.EffectFiber;
@@ -165,7 +165,7 @@ test "Scheduler: nested handler chain with multi-file IO across fibers" {
     }.handle, null);
 
     // Inner: delegate ReadFile
-    inner.onPerform(ReadFile, &struct {
+    inner.onPerformSync(ReadFile, &struct {
         fn handle(_: *ReadFile.Value, cont: *Cont(ReadFile), _: ?*anyopaque) void {
             cont.delegate();
         }
@@ -175,7 +175,7 @@ test "Scheduler: nested handler chain with multi-file IO across fibers" {
     defer outer.deinit();
 
     // Outer: handle ReadFile with mock content
-    outer.onPerform(ReadFile, &struct {
+    outer.onPerformSync(ReadFile, &struct {
         fn handle(filename: *ReadFile.Value, cont: *Cont(ReadFile), _: ?*anyopaque) void {
             // Return the filename itself as "contents" (proves delegation worked).
             cont.@"resume"(filename.*);

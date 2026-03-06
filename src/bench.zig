@@ -229,7 +229,7 @@ fn benchPerformDispatch(iters: usize) u64 {
 
     var handlers = HandlerSet.init(allocator);
     defer handlers.deinit();
-    handlers.onPerform(BenchPerform, &struct {
+    handlers.onPerformSync(BenchPerform, &struct {
         fn handle(_: *BenchPerform.Value, cont: *Cont(BenchPerform), _: ?*anyopaque) void {
             cont.@"resume"(42);
         }
@@ -257,7 +257,7 @@ fn benchEffectfulPerform(iters: usize) u64 {
     var sched = sched_mod.Scheduler.init(allocator, 1) catch @panic("OOM");
 
     var handlers = HandlerSet.init(allocator);
-    handlers.onPerformEffect(BenchPerform, &struct {
+    handlers.onPerform(BenchPerform, &struct {
         fn handle(_: *BenchPerform.Value, cont: *Cont(BenchPerform), _: *EffectContext, _: ?*anyopaque) void {
             cont.@"resume"(42);
         }
@@ -304,7 +304,7 @@ fn benchScheduler(iters: usize) u64 {
 
     var handlers = HandlerSet.init(allocator);
     defer handlers.deinit();
-    handlers.onPerform(BenchPerform, &struct {
+    handlers.onPerformSync(BenchPerform, &struct {
         fn handle(_: *BenchPerform.Value, cont: *Cont(BenchPerform), _: ?*anyopaque) void {
             cont.@"resume"(42);
         }
@@ -350,7 +350,7 @@ fn benchSchedulerMulticore(iters: usize) u64 {
 
     var handlers = HandlerSet.init(allocator);
     defer handlers.deinit();
-    handlers.onPerform(BenchPerform, &struct {
+    handlers.onPerformSync(BenchPerform, &struct {
         fn handle(_: *BenchPerform.Value, cont: *Cont(BenchPerform), _: ?*anyopaque) void {
             cont.@"resume"(42);
         }

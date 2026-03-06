@@ -1034,7 +1034,7 @@ test "Scheduler: IO combined with algebraic effects" {
 
     var handlers = HandlerSet.init(testing.allocator);
     defer handlers.deinit();
-    handlers.onPerform(GetVal, &struct {
+    handlers.onPerformSync(GetVal, &struct {
         fn handle(_: *GetVal.Value, cont: *cont_mod.Cont(GetVal), _: ?*anyopaque) void {
             cont.@"resume"(21);
         }
@@ -1069,7 +1069,7 @@ test "Scheduler: 100 fibers, 4 workers, atomic counter" {
 
     var handlers = HandlerSet.init(testing.allocator);
     defer handlers.deinit();
-    handlers.onPerform(BenchPerform, &struct {
+    handlers.onPerformSync(BenchPerform, &struct {
         fn handle(_: *BenchPerform.Value, cont: *cont_mod.Cont(BenchPerform), _: ?*anyopaque) void {
             cont.@"resume"(1);
         }
@@ -1114,7 +1114,7 @@ test "Scheduler: two fibers, 2 workers, both complete" {
 
     var handlers = HandlerSet.init(testing.allocator);
     defer handlers.deinit();
-    handlers.onPerform(BenchPerform, &struct {
+    handlers.onPerformSync(BenchPerform, &struct {
         fn handle(_: *BenchPerform.Value, cont: *cont_mod.Cont(BenchPerform), _: ?*anyopaque) void {
             cont.@"resume"(42);
         }
@@ -1247,7 +1247,7 @@ test "Scheduler: IO + effects interleaved" {
 
     var handlers = HandlerSet.init(testing.allocator);
     defer handlers.deinit();
-    handlers.onPerform(GetVal, &struct {
+    handlers.onPerformSync(GetVal, &struct {
         fn handle(_: *GetVal.Value, cont: *cont_mod.Cont(GetVal), _: ?*anyopaque) void {
             cont.@"resume"(7);
         }
