@@ -41,7 +41,6 @@ pub const run = dispatch_mod.run;
 // Scheduling
 const sched_mod = @import("scheduler.zig");
 pub const Scheduler = sched_mod.Scheduler;
-pub const FiberResult = sched_mod.FiberResult;
 
 // ============================================================
 // §8. Tests
@@ -60,7 +59,8 @@ test "perform: handler resumes with a value" {
     const State = struct { sum: i32 = 0 };
     var state = State{};
 
-    var fib = try initFiberDefault(&struct {
+    var fib: EffectFiber = undefined;
+    try initFiberDefault(&fib, &struct {
         fn body(ctx: *EffectContext) void {
             const a = ctx.perform(GetInt, "first");
             ctx.emit(Result, a);
@@ -95,7 +95,8 @@ test "emit: observers see values" {
     const State = struct { count: usize = 0 };
     var state = State{};
 
-    var fib = try initFiberDefault(&struct {
+    var fib: EffectFiber = undefined;
+    try initFiberDefault(&fib, &struct {
         fn body(ctx: *EffectContext) void {
             ctx.emit(Log, "one");
             ctx.emit(Log, "two");
@@ -126,7 +127,8 @@ test "mixed perform and emit" {
     const State = struct { trace_sum: i32 = 0 };
     var state = State{};
 
-    var fib = try initFiberDefault(&struct {
+    var fib: EffectFiber = undefined;
+    try initFiberDefault(&fib, &struct {
         fn body(ctx: *EffectContext) void {
             ctx.emit(Trace, 1);
             const sum = ctx.perform(Add, 10);
@@ -159,7 +161,8 @@ test "mixed perform and emit" {
 test "perform handler can drop continuation" {
     const Abort = Perform(void, void);
 
-    var fib = try initFiberDefault(&struct {
+    var fib: EffectFiber = undefined;
+    try initFiberDefault(&fib, &struct {
         fn body(ctx: *EffectContext) void {
             ctx.perform(Abort, {});
             @panic("unreachable after drop");
@@ -184,7 +187,8 @@ test "perform handler can drop continuation" {
 test "auto-drop when handler forgets to resume" {
     const Oops = Perform(u8, u8);
 
-    var fib = try initFiberDefault(&struct {
+    var fib: EffectFiber = undefined;
+    try initFiberDefault(&fib, &struct {
         fn body(ctx: *EffectContext) void {
             _ = ctx.perform(Oops, 1);
             @panic("unreachable after auto-drop");
@@ -230,7 +234,8 @@ test "multiple emit observers for same effect" {
     const State = struct { a: usize = 0, b: usize = 0 };
     var state = State{};
 
-    var fib = try initFiberDefault(&struct {
+    var fib: EffectFiber = undefined;
+    try initFiberDefault(&fib, &struct {
         fn body(ctx: *EffectContext) void {
             ctx.emit(Ping, {});
         }
@@ -267,7 +272,8 @@ test "multiple emit observers for same effect" {
 test "child delegates perform to parent" {
     const Fetch = Perform([]const u8, i32);
 
-    var fib = try initFiberDefault(&struct {
+    var fib: EffectFiber = undefined;
+    try initFiberDefault(&fib, &struct {
         fn body(ctx: *EffectContext) void {
             const val = ctx.perform(Fetch, "key");
             std.debug.assert(val == 99);
@@ -306,7 +312,8 @@ test "conditional delegation (cache pattern)" {
     const State = struct { results: [2]i32 = .{ 0, 0 }, idx: usize = 0 };
     var state = State{};
 
-    var fib = try initFiberDefault(&struct {
+    var fib: EffectFiber = undefined;
+    try initFiberDefault(&fib, &struct {
         fn body(ctx: *EffectContext) void {
             const a = ctx.perform(Lookup, "cached");
             ctx.emit(Result, a);
@@ -359,7 +366,8 @@ test "emit propagates to all layers" {
     const State = struct { child_count: usize = 0, parent_count: usize = 0 };
     var state = State{};
 
-    var fib = try initFiberDefault(&struct {
+    var fib: EffectFiber = undefined;
+    try initFiberDefault(&fib, &struct {
         fn body(ctx: *EffectContext) void {
             ctx.emit(Ping, {});
             ctx.emit(Ping, {});
@@ -395,7 +403,8 @@ test "emit propagates to all layers" {
 test "three-level delegation chain" {
     const Ask = Perform(u8, u8);
 
-    var fib = try initFiberDefault(&struct {
+    var fib: EffectFiber = undefined;
+    try initFiberDefault(&fib, &struct {
         fn body(ctx: *EffectContext) void {
             const val = ctx.perform(Ask, 1);
             std.debug.assert(val == 77);
@@ -440,7 +449,8 @@ test "three-level delegation chain" {
 test "auto-drop preserved with delegation in chain" {
     const Oops = Perform(u8, u8);
 
-    var fib = try initFiberDefault(&struct {
+    var fib: EffectFiber = undefined;
+    try initFiberDefault(&fib, &struct {
         fn body(ctx: *EffectContext) void {
             _ = ctx.perform(Oops, 1);
             @panic("unreachable after auto-drop");
@@ -479,13 +489,15 @@ test "auto-drop preserved with delegation in chain" {
 test "scheduler: effectful handler re-performs effect" {
     const Lookup = Perform([]const u8, i32);
 
-    var fib = try initFiberDefault(&struct {
+    var sched = try Scheduler.init(testing.allocator, 1);
+    defer sched.deinit();
+    const entry = try sched.createFiber(&struct {
         fn body(ctx: *EffectContext) void {
             const val = ctx.perform(Lookup, "key");
             std.debug.assert(val == 42);
         }
-    }.body);
-    defer fib.deinit();
+    }.body, 0);
+    defer sched.destroyFiber(entry);
 
     // Child: effectful handler that re-performs
     var child_hs = HandlerSet.init(testing.allocator);
@@ -507,12 +519,10 @@ test "scheduler: effectful handler re-performs effect" {
     }.handle, null);
 
     child_hs.setParent(&parent_hs);
-    var sched = try Scheduler.init(testing.allocator, 1);
-    defer sched.deinit();
-    try sched.spawn(&fib, null, &child_hs);
+    try sched.spawn(entry, &child_hs);
     sched.run();
 
-    try testing.expect(!fib.isAlive());
+    try testing.expect(!entry.fiber.isAlive());
 }
 
 test "scheduler: pre/post work around re-perform" {
@@ -525,13 +535,15 @@ test "scheduler: pre/post work around re-perform" {
     };
     var state = State{};
 
-    var fib = try initFiberDefault(&struct {
+    var sched = try Scheduler.init(testing.allocator, 1);
+    defer sched.deinit();
+    const entry = try sched.createFiber(&struct {
         fn body(ctx: *EffectContext) void {
             const val = ctx.perform(Lookup, "key");
             std.debug.assert(val == 42);
         }
-    }.body);
-    defer fib.deinit();
+    }.body, 0);
+    defer sched.destroyFiber(entry);
 
     // Effectful handler: emits before and after re-perform
     var child_hs = HandlerSet.init(testing.allocator);
@@ -562,9 +574,7 @@ test "scheduler: pre/post work around re-perform" {
     }.handle, @ptrCast(&state));
 
     child_hs.setParent(&parent_hs);
-    var sched = try Scheduler.init(testing.allocator, 1);
-    defer sched.deinit();
-    try sched.spawn(&fib, null, &child_hs);
+    try sched.spawn(entry, &child_hs);
     sched.run();
 
     try testing.expectEqual(@as(usize, 2), state.idx);
@@ -575,13 +585,15 @@ test "scheduler: pre/post work around re-perform" {
 test "scheduler: effectful handler transforms result" {
     const Lookup = Perform([]const u8, i32);
 
-    var fib = try initFiberDefault(&struct {
+    var sched = try Scheduler.init(testing.allocator, 1);
+    defer sched.deinit();
+    const entry = try sched.createFiber(&struct {
         fn body(ctx: *EffectContext) void {
             const val = ctx.perform(Lookup, "key");
             std.debug.assert(val == 84); // parent's 42 doubled
         }
-    }.body);
-    defer fib.deinit();
+    }.body, 0);
+    defer sched.destroyFiber(entry);
 
     var child_hs = HandlerSet.init(testing.allocator);
     defer child_hs.deinit();
@@ -601,24 +613,24 @@ test "scheduler: effectful handler transforms result" {
     }.handle, null);
 
     child_hs.setParent(&parent_hs);
-    var sched = try Scheduler.init(testing.allocator, 1);
-    defer sched.deinit();
-    try sched.spawn(&fib, null, &child_hs);
+    try sched.spawn(entry, &child_hs);
     sched.run();
 
-    try testing.expect(!fib.isAlive());
+    try testing.expect(!entry.fiber.isAlive());
 }
 
 test "scheduler: effectful handler drops origin" {
     const Abort = Perform(void, void);
 
-    var fib = try initFiberDefault(&struct {
+    var sched = try Scheduler.init(testing.allocator, 1);
+    defer sched.deinit();
+    const entry = try sched.createFiber(&struct {
         fn body(ctx: *EffectContext) void {
             ctx.perform(Abort, {});
             @panic("unreachable after drop");
         }
-    }.body);
-    defer fib.deinit();
+    }.body, 0);
+    defer sched.destroyFiber(entry);
 
     var handlers = HandlerSet.init(testing.allocator);
     defer handlers.deinit();
@@ -628,24 +640,24 @@ test "scheduler: effectful handler drops origin" {
         }
     }.handle, null);
 
-    var sched = try Scheduler.init(testing.allocator, 1);
-    defer sched.deinit();
-    try sched.spawn(&fib, null, &handlers);
+    try sched.spawn(entry, &handlers);
     sched.run();
 
-    try testing.expect(!fib.isAlive());
+    try testing.expect(!entry.fiber.isAlive());
 }
 
 test "scheduler: effectful handler delegates" {
     const Lookup = Perform([]const u8, i32);
 
-    var fib = try initFiberDefault(&struct {
+    var sched = try Scheduler.init(testing.allocator, 1);
+    defer sched.deinit();
+    const entry = try sched.createFiber(&struct {
         fn body(ctx: *EffectContext) void {
             const val = ctx.perform(Lookup, "key");
             std.debug.assert(val == 99);
         }
-    }.body);
-    defer fib.deinit();
+    }.body, 0);
+    defer sched.destroyFiber(entry);
 
     var child_hs = HandlerSet.init(testing.allocator);
     defer child_hs.deinit();
@@ -664,24 +676,24 @@ test "scheduler: effectful handler delegates" {
     }.handle, null);
 
     child_hs.setParent(&parent_hs);
-    var sched = try Scheduler.init(testing.allocator, 1);
-    defer sched.deinit();
-    try sched.spawn(&fib, null, &child_hs);
+    try sched.spawn(entry, &child_hs);
     sched.run();
 
-    try testing.expect(!fib.isAlive());
+    try testing.expect(!entry.fiber.isAlive());
 }
 
 test "scheduler: effectful handler auto-drop" {
     const Oops = Perform(u8, u8);
 
-    var fib = try initFiberDefault(&struct {
+    var sched = try Scheduler.init(testing.allocator, 1);
+    defer sched.deinit();
+    const entry = try sched.createFiber(&struct {
         fn body(ctx: *EffectContext) void {
             _ = ctx.perform(Oops, 1);
             @panic("unreachable after auto-drop");
         }
-    }.body);
-    defer fib.deinit();
+    }.body, 0);
+    defer sched.destroyFiber(entry);
 
     var handlers = HandlerSet.init(testing.allocator);
     defer handlers.deinit();
@@ -691,26 +703,26 @@ test "scheduler: effectful handler auto-drop" {
         }
     }.handle, null);
 
-    var sched = try Scheduler.init(testing.allocator, 1);
-    defer sched.deinit();
-    try sched.spawn(&fib, null, &handlers);
+    try sched.spawn(entry, &handlers);
     sched.run();
 
-    try testing.expect(!fib.isAlive());
+    try testing.expect(!entry.fiber.isAlive());
 }
 
 test "scheduler: mixed simple and effectful handlers" {
     const Lookup = Perform([]const u8, i32);
 
-    var fib = try initFiberDefault(&struct {
+    var sched = try Scheduler.init(testing.allocator, 1);
+    defer sched.deinit();
+    const entry = try sched.createFiber(&struct {
         fn body(ctx: *EffectContext) void {
             const a = ctx.perform(Lookup, "cached");
             const b = ctx.perform(Lookup, "miss");
             std.debug.assert(a == 10);
             std.debug.assert(b == 84); // 42 * 2
         }
-    }.body);
-    defer fib.deinit();
+    }.body, 0);
+    defer sched.destroyFiber(entry);
 
     // Child: simple handler — cache hit for "cached", delegate for miss
     var child_hs = HandlerSet.init(testing.allocator);
@@ -746,24 +758,24 @@ test "scheduler: mixed simple and effectful handlers" {
 
     child_hs.setParent(&middle_hs);
     middle_hs.setParent(&parent_hs);
-    var sched = try Scheduler.init(testing.allocator, 1);
-    defer sched.deinit();
-    try sched.spawn(&fib, null, &child_hs);
+    try sched.spawn(entry, &child_hs);
     sched.run();
 
-    try testing.expect(!fib.isAlive());
+    try testing.expect(!entry.fiber.isAlive());
 }
 
 test "scheduler: nested effectful handlers" {
     const Lookup = Perform([]const u8, i32);
 
-    var fib = try initFiberDefault(&struct {
+    var sched = try Scheduler.init(testing.allocator, 1);
+    defer sched.deinit();
+    const entry = try sched.createFiber(&struct {
         fn body(ctx: *EffectContext) void {
             const val = ctx.perform(Lookup, "key");
             std.debug.assert(val == 52); // inner adds 10 to outer's passthrough of 42
         }
-    }.body);
-    defer fib.deinit();
+    }.body, 0);
+    defer sched.destroyFiber(entry);
 
     // Inner effectful: re-performs, adds 10
     var inner_hs = HandlerSet.init(testing.allocator);
@@ -796,12 +808,10 @@ test "scheduler: nested effectful handlers" {
 
     inner_hs.setParent(&outer_hs);
     outer_hs.setParent(&base_hs);
-    var sched = try Scheduler.init(testing.allocator, 1);
-    defer sched.deinit();
-    try sched.spawn(&fib, null, &inner_hs);
+    try sched.spawn(entry, &inner_hs);
     sched.run();
 
-    try testing.expect(!fib.isAlive());
+    try testing.expect(!entry.fiber.isAlive());
 }
 
 test "scheduler: simple-only handlers match run() behavior" {
@@ -810,15 +820,17 @@ test "scheduler: simple-only handlers match run() behavior" {
     const State = struct { sum: i32 = 0 };
     var state = State{};
 
-    var fib = try initFiberDefault(&struct {
+    var sched = try Scheduler.init(testing.allocator, 1);
+    defer sched.deinit();
+    const entry = try sched.createFiber(&struct {
         fn body(ctx: *EffectContext) void {
             const a = ctx.perform(GetInt, "first");
             ctx.emit(Result, a);
             const b = ctx.perform(GetInt, "second");
             ctx.emit(Result, b);
         }
-    }.body);
-    defer fib.deinit();
+    }.body, 0);
+    defer sched.destroyFiber(entry);
 
     var handlers = HandlerSet.init(testing.allocator);
     defer handlers.deinit();
@@ -836,9 +848,7 @@ test "scheduler: simple-only handlers match run() behavior" {
         }
     }.handle, @ptrCast(&state));
 
-    var sched = try Scheduler.init(testing.allocator, 1);
-    defer sched.deinit();
-    try sched.spawn(&fib, null, &handlers);
+    try sched.spawn(entry, &handlers);
     sched.run();
 
     try testing.expectEqual(@as(i32, 84), state.sum);
@@ -854,13 +864,15 @@ test "scheduler: effectful handler emits to parent observers" {
     };
     var state = State{};
 
-    var fib = try initFiberDefault(&struct {
+    var sched = try Scheduler.init(testing.allocator, 1);
+    defer sched.deinit();
+    const entry = try sched.createFiber(&struct {
         fn body(ctx: *EffectContext) void {
             const val = ctx.perform(Lookup, "key");
             std.debug.assert(val == 42);
         }
-    }.body);
-    defer fib.deinit();
+    }.body, 0);
+    defer sched.destroyFiber(entry);
 
     // Child: effectful handler that emits trace events
     var child_hs = HandlerSet.init(testing.allocator);
@@ -891,9 +903,7 @@ test "scheduler: effectful handler emits to parent observers" {
     }.handle, @ptrCast(&state));
 
     child_hs.setParent(&parent_hs);
-    var sched = try Scheduler.init(testing.allocator, 1);
-    defer sched.deinit();
-    try sched.spawn(&fib, null, &child_hs);
+    try sched.spawn(entry, &child_hs);
     sched.run();
 
     try testing.expectEqual(@as(usize, 2), state.idx);

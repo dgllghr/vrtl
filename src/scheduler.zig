@@ -50,23 +50,27 @@ threadlocal var original_net_write_fn: *const NetWriteFn = undefined;
 /// Threadlocal for passing IO args from interceptAwait to the scheduler.
 threadlocal var pending_io: ?PendingIo = null;
 
+const MAX_EMIT_VALUE = 128;
+
 /// Threadlocal for passing emit observer context from processEntry to the observer body.
 const EmitObserverInfo = struct {
     id: usize,
     value_ptr: *anyopaque,
+    value_size: usize,
     handlers: *const HandlerSet,
 };
 threadlocal var emit_observer_info: EmitObserverInfo = undefined;
 
 fn emitObserverBody(ectx: *EffectContext) void {
     const info = emit_observer_info;
+    // Copy emit value to coroutine stack (zero heap alloc)
+    var value_buf: [MAX_EMIT_VALUE]u8 align(16) = undefined;
+    @memcpy(value_buf[0..info.value_size], @as([*]const u8, @ptrCast(info.value_ptr))[0..info.value_size]);
     _ = ectx.handle.yield(.{ .kind = .@"suspend" });
-    const eff = RawEffect{ .id = info.id, .kind = .emit, .value_ptr = info.value_ptr, .value_size = 0 };
+    const eff = RawEffect{ .id = info.id, .kind = .emit, .value_ptr = @ptrCast(&value_buf), .value_size = 0 };
     dispatch_mod.dispatchEmit(&eff, info.handlers);
-    // value_buf is freed by the scheduler in the dead-fiber cleanup path,
-    // not here — calling free() on a coroutine's small stack can overflow
-    // with debug allocators.
 }
+
 
 fn interceptAwait(userdata: ?*anyopaque, future: *std.Io.AnyFuture, result_buf: []u8, alignment: std.mem.Alignment) void {
     const handle = active_fiber_handle orelse @panic("interceptAwait called without active fiber handle");
@@ -148,12 +152,6 @@ fn interceptNetWrite(userdata: ?*anyopaque, dest: net.Socket.Handle, header: []c
     _ = h.yield(.{ .kind = .@"suspend" });
     return ctx.result;
 }
-
-/// Result of createFiber — bundles the fiber with its handle pointer.
-pub const FiberResult = struct {
-    fiber: EffectFiber,
-    handle: *EffectFiber.Handle,
-};
 
 const HandlerFiberCtx = handler_mod.HandlerFiberCtx;
 const initFiberPooled = types.initFiberPooled;
@@ -247,6 +245,11 @@ const Inbox = struct {
     }
 };
 
+/// Intrusive freelist node overlaid on a dead FiberEntry for observer recycling.
+const ObserverNode = struct {
+    next: ?*ObserverNode,
+};
+
 pub const Worker = struct {
     deque: Deque(*Scheduler.FiberEntry),
     pool: StackPool = .{},
@@ -256,6 +259,8 @@ pub const Worker = struct {
     parent: *Scheduler,
     rng_state: u32,
     park_state: u32 = PARK_RUNNING,
+    /// Per-worker freelist of recycled observer FiberEntries (avoids GPA alloc/free per emit).
+    observer_freelist: ?*ObserverNode = null,
 
     fn initWorker(alloc: std.mem.Allocator, id: u32, parent: *Scheduler) !Worker {
         return .{
@@ -269,15 +274,33 @@ pub const Worker = struct {
     fn deinitWorker(self: *Worker) void {
         self.pool.deinit();
         while (self.deque.pop()) |entry| {
-            if (entry.owns_fiber) {
-                entry.fiber.deinit();
-                self.parent.allocator.destroy(entry.fiber);
-            }
-            if (entry.emit_value_buf) |buf| self.parent.allocator.free(buf);
+            entry.fiber.deinit();
+            self.parent.allocator.destroy(entry);
+        }
+        // Drain observer freelist
+        while (self.observer_freelist) |node| {
+            self.observer_freelist = node.next;
+            const entry: *Scheduler.FiberEntry = @ptrCast(@alignCast(node));
             self.parent.allocator.destroy(entry);
         }
         self.deque.deinit();
         self.inbox.deinit(self.parent.allocator);
+    }
+
+    /// Get a recycled observer FiberEntry, or allocate a new one.
+    fn allocObserver(self: *Worker) *Scheduler.FiberEntry {
+        if (self.observer_freelist) |node| {
+            self.observer_freelist = node.next;
+            return @ptrCast(@alignCast(node));
+        }
+        return self.parent.allocator.create(Scheduler.FiberEntry) catch @panic("OOM");
+    }
+
+    /// Return an observer FiberEntry to the freelist for reuse.
+    fn freeObserver(self: *Worker, entry: *Scheduler.FiberEntry) void {
+        const node: *ObserverNode = @ptrCast(@alignCast(entry));
+        node.next = self.observer_freelist;
+        self.observer_freelist = node;
     }
 
     /// xorshift32 PRNG for steal target selection.
@@ -303,78 +326,78 @@ pub const Worker = struct {
     }
 
     /// Process a single fiber entry — dispatch its pending effect.
+    /// Performs and emits are dispatched inline in a tight loop.
+    /// Only returns to the main loop on suspend, park, or death.
     fn processEntry(self: *Worker, entry: *FiberEntry) void {
         const sched = self.parent;
-        if (entry.pending_effect) |eff| {
+
+        // Fast path: if no pending effect, handle unstarted/dead fiber
+        if (entry.pending_effect == null) {
+            if (entry.fiber.isAlive()) {
+                // Stolen entry that hasn't been started yet
+                if (entry.fiber.isSuspended()) {
+                    activateFiber(entry);
+                    entry.pending_effect = entry.fiber.resumeVoid();
+                } else {
+                    entry.pending_effect = entry.fiber.start();
+                }
+                captureFiber(entry);
+                entry.pending_io = pending_io;
+                pending_io = null;
+                // Fall through to the dispatch loop below
+            } else {
+                // Dead fiber — clean up
+                entry.fiber.deinit();
+                if (entry.owns_entry) {
+                    self.freeObserver(entry);
+                }
+                const prev = @atomicRmw(isize, &sched.live_fibers, .Sub, 1, .release);
+                if (prev <= 1) {
+                    @atomicStore(u32, &sched.shutdown, 1, .release);
+                    sched.wakeAll();
+                }
+                return;
+            }
+        }
+
+        // Tight dispatch loop — process performs/emits inline without
+        // bouncing through the deque between each effect.
+        while (entry.pending_effect) |eff| {
             switch (eff.kind) {
                 .perform => {
                     activateFiber(entry);
-                    entry.pending_effect = self.dispatchPerformScheduled(&eff, entry.fiber, entry.handlers);
+                    entry.pending_effect = self.dispatchPerformScheduled(&eff, &entry.fiber, entry.handlers);
                     captureFiber(entry);
                     entry.pending_io = pending_io;
                     pending_io = null;
-                    self.deque.push(entry) catch unreachable;
                 },
                 .emit => {
-                    // Heap-copy emit value (emitting fiber's stack becomes invalid after resume)
-                    const value_size = eff.value_size;
-                    const value_copy = sched.allocator.alloc(u8, value_size) catch @panic("OOM");
-                    @memcpy(value_copy, @as([*]const u8, @ptrCast(eff.value_ptr))[0..value_size]);
-
-                    // Create observer fiber via TLS pattern
-                    emit_observer_info = .{
-                        .id = eff.id,
-                        .value_ptr = @ptrCast(value_copy.ptr),
-                        .handlers = entry.handlers,
-                    };
-                    const obs_fiber_ptr = sched.allocator.create(EffectFiber) catch @panic("OOM");
-                    obs_fiber_ptr.* = initFiberPooled(&self.pool, &emitObserverBody) catch @panic("OOM");
-                    const obs_start = obs_fiber_ptr.start(); // captures TLS, yields .suspend
-
-                    const obs_entry = sched.allocator.create(FiberEntry) catch @panic("OOM");
-                    obs_entry.* = .{
-                        .fiber = obs_fiber_ptr,
-                        .handlers = entry.handlers,
-                        .handle = null,
-                        .pending_effect = obs_start,
-                        .owns_fiber = true,
-                        .emit_value_buf = value_copy,
-                    };
-
-                    // Resume emitting fiber immediately
+                    dispatch_mod.dispatchEmit(&eff, entry.handlers);
                     activateFiber(entry);
                     entry.pending_effect = entry.fiber.resumeVoid();
                     captureFiber(entry);
                     entry.pending_io = pending_io;
                     pending_io = null;
-
-                    // Push observer first (stealable), then emitting fiber (LIFO = runs next)
-                    self.deque.push(obs_entry) catch unreachable;
-                    self.deque.push(entry) catch unreachable;
-                    _ = @atomicRmw(isize, &sched.live_fibers, .Add, 1, .monotonic);
                 },
                 .@"suspend" => {
-                    // Check entry first (captured in start phase), then TLS
                     const pio = entry.pending_io orelse blk: {
                         const tls = pending_io;
                         pending_io = null;
                         break :blk tls;
                     };
                     if (pio) |io_args| {
-                        // Real IO — park fiber, submit to BG thread
+                        // Real IO — hand off to BG thread
                         entry.pending_io = io_args;
                         self.submitIoWait(entry);
-                    } else {
-                        // Initial yield or no-op — resume immediately
-                        entry.pending_io = null;
-                        activateFiber(entry);
-                        entry.pending_effect = entry.fiber.resumeVoid();
-                        captureFiber(entry);
-                        // Capture any new pending_io from the resumed fiber
-                        entry.pending_io = pending_io;
-                        pending_io = null;
-                        self.deque.push(entry) catch unreachable;
+                        return;
                     }
+                    // No-op suspend — resume immediately
+                    entry.pending_io = null;
+                    activateFiber(entry);
+                    entry.pending_effect = entry.fiber.resumeVoid();
+                    captureFiber(entry);
+                    entry.pending_io = pending_io;
+                    pending_io = null;
                 },
                 .park => {
                     const wh: *WakeHandle = @ptrCast(@alignCast(eff.value_ptr));
@@ -382,47 +405,28 @@ pub const Worker = struct {
                     wh._data[1] = @intFromPtr(self);
                     wh._data[2] = @intFromPtr(sched);
                     wh._wake_fn = &doWakePark;
-                    // CAS INIT → PARKED; release syncs _data/_wake_fn with wake()'s acquire
                     if (@cmpxchgStrong(u32, &wh.state, WakeHandle.INIT, WakeHandle.PARKED, .acq_rel, .acquire)) |actual| {
                         if (actual == WakeHandle.WOKEN) {
-                            // Early wake — resume immediately
+                            // Early wake — re-enqueue
                             entry.pending_effect = .{ .kind = .@"suspend" };
                             entry.pending_io = null;
                             self.deque.push(entry) catch unreachable;
                         }
                     }
-                    // CAS succeeded → fiber is parked, NOT re-enqueued
+                    return;
                 },
             }
-            // Wake a peer after pushing work back
-            sched.wakeOne(self);
-        } else if (entry.fiber.isAlive()) {
-            // Stolen entry that hasn't been started yet — initialize it
-            if (entry.fiber.isSuspended()) {
-                activateFiber(entry);
-                entry.pending_effect = entry.fiber.resumeVoid();
-            } else {
-                entry.pending_effect = entry.fiber.start();
-            }
-            captureFiber(entry);
-            entry.pending_io = pending_io;
-            pending_io = null;
-            self.deque.push(entry) catch unreachable;
-            sched.wakeOne(self);
-        } else {
-            // Fiber is dead — clean up, decrement live count
-            if (entry.owns_fiber) {
-                entry.fiber.deinit();
-                sched.allocator.destroy(entry.fiber);
-            }
-            if (entry.emit_value_buf) |buf| sched.allocator.free(buf);
-            sched.allocator.destroy(entry);
-            const prev = @atomicRmw(isize, &sched.live_fibers, .Sub, 1, .release);
-            if (prev <= 1) {
-                // Last fiber died — signal shutdown
-                @atomicStore(u32, &sched.shutdown, 1, .release);
-                sched.wakeAll();
-            }
+        }
+
+        // pending_effect is null — fiber completed
+        entry.fiber.deinit();
+        if (entry.owns_entry) {
+            self.freeObserver(entry);
+        }
+        const prev = @atomicRmw(isize, &sched.live_fibers, .Sub, 1, .release);
+        if (prev <= 1) {
+            @atomicStore(u32, &sched.shutdown, 1, .release);
+            sched.wakeAll();
         }
     }
 
@@ -596,7 +600,8 @@ pub const Worker = struct {
                     };
                     handler_mod.handler_fiber_ctx_tls = &hctx;
 
-                    var hfib = initFiberPooled(&self.pool, binding.fiber_body) catch @panic("OOM");
+                    var hfib: EffectFiber = undefined;
+                    initFiberPooled(&hfib, &self.pool, binding.fiber_body) catch @panic("OOM");
                     defer hfib.deinit();
 
                     // Run handler fiber — dispatch ITS effects to parent scope
@@ -666,13 +671,14 @@ pub const Scheduler = struct {
     };
 
     pub const FiberEntry = struct {
-        fiber: *EffectFiber,
+        fiber: EffectFiber,
         handlers: *const HandlerSet,
         handle: ?*EffectFiber.Handle,
         pending_effect: ?RawEffect,
         pending_io: ?PendingIo = null,
-        owns_fiber: bool = false,
-        emit_value_buf: ?[]u8 = null,
+        /// If true, scheduler frees this entry on fiber death (observer fibers).
+        /// User-created entries (from createFiber) are false — user calls destroyFiber.
+        owns_entry: bool = false,
     };
 
     /// Initialize a scheduler with `num_workers` workers.
@@ -713,15 +719,9 @@ pub const Scheduler = struct {
         self.io_threads.deinit(self.allocator);
     }
 
-    pub fn spawn(self: *Scheduler, fiber: *EffectFiber, handle: ?*EffectFiber.Handle, handlers: *const HandlerSet) !void {
+    pub fn spawn(self: *Scheduler, entry: *FiberEntry, handlers: *const HandlerSet) !void {
         self.fixupParents();
-        const entry = try self.allocator.create(FiberEntry);
-        entry.* = .{
-            .fiber = fiber,
-            .handlers = handlers,
-            .handle = handle,
-            .pending_effect = null,
-        };
+        entry.handlers = handlers;
         try self.spawn_buffer.append(self.allocator, entry);
         _ = @atomicRmw(isize, &self.live_fibers, .Add, 1, .monotonic);
     }
@@ -749,10 +749,17 @@ pub const Scheduler = struct {
         };
     }
 
-    pub fn createFiber(self: *Scheduler, body: EffectBodyFn, inner_io: std.Io, stack_size: usize) !FiberResult {
+    /// Set the IO backend for all fibers. Call before createFiber.
+    /// If not called, fibers get a noop IO.
+    pub fn setIo(self: *Scheduler, inner_io: std.Io) void {
+        self.setupIo(inner_io);
+    }
+
+    pub fn createFiber(self: *Scheduler, body: EffectBodyFn, stack_size: usize) !*FiberEntry {
         self.fixupParents();
         if (self.io_state == null) {
-            self.setupIo(inner_io);
+            var noop_vt = makeNoopVtable();
+            self.setupIo(.{ .userdata = null, .vtable = &noop_vt });
         }
 
         const Static = struct {
@@ -762,8 +769,10 @@ pub const Scheduler = struct {
         Static.current_body = body;
         Static.current_io = self.io_state.?.wrappedIo();
 
+        const entry = try self.allocator.create(FiberEntry);
+
         // Always use worker 0's pool for createFiber (called from main thread)
-        var fib = try EffectFiber.initPooled(&struct {
+        try entry.fiber.initPooled(&struct {
             fn wrapper(h: *EffectFiber.Handle) void {
                 const b = Static.current_body;
                 const io = Static.current_io;
@@ -774,11 +783,22 @@ pub const Scheduler = struct {
             }
         }.wrapper, stack_size, &self.workers[0].pool);
 
-        _ = fib.start();
+        _ = entry.fiber.start();
 
         const handle = active_fiber_handle orelse @panic("createFiber: wrapper did not set active_fiber_handle");
 
-        return .{ .fiber = fib, .handle = handle };
+        entry.handle = handle;
+        entry.pending_effect = null;
+        entry.pending_io = null;
+
+        return entry;
+    }
+
+    /// Destroy a fiber entry created by createFiber.
+    /// Safe to call after run() — deinit is idempotent for dead fibers.
+    pub fn destroyFiber(self: *Scheduler, entry: *FiberEntry) void {
+        entry.fiber.deinit();
+        self.allocator.destroy(entry);
     }
 
     pub fn run(self: *Scheduler) void {
@@ -875,16 +895,17 @@ test "Scheduler: single fiber yields on await then completes" {
 
     var sched = try Scheduler.init(testing.allocator, 1);
     defer sched.deinit();
+    sched.setIo(mock_io);
 
-    var res = try sched.createFiber(&struct {
+    const res = try sched.createFiber(&struct {
         fn body(ctx: *EffectContext) void {
             // Simulate an IO await by calling await through the io interface
             var dummy_future: DummyFuture = .{};
             ctx.io.vtable.await(ctx.io.userdata, @ptrCast(&dummy_future), &.{}, .@"1");
             ctx.emit(Result, 42);
         }
-    }.body, mock_io, 0);
-    defer res.fiber.deinit();
+    }.body, 0);
+    defer sched.destroyFiber(res);
 
     var handlers = HandlerSet.init(testing.allocator);
     defer handlers.deinit();
@@ -895,7 +916,7 @@ test "Scheduler: single fiber yields on await then completes" {
         }
     }.handle, @ptrCast(&result_val));
 
-    try sched.spawn(&res.fiber, res.handle, &handlers);
+    try sched.spawn(res, &handlers);
     sched.run();
 
     try testing.expectEqual(@as(usize, 1), State.await_count);
@@ -925,8 +946,9 @@ test "Scheduler: two fibers LIFO depth-first" {
 
     var sched = try Scheduler.init(testing.allocator, 1);
     defer sched.deinit();
+    sched.setIo(mock_io);
 
-    var res1 = try sched.createFiber(&struct {
+    const res1 = try sched.createFiber(&struct {
         fn body(ctx: *EffectContext) void {
             ctx.emit(Trace, 'A');
             // Trigger an IO await to yield
@@ -934,18 +956,18 @@ test "Scheduler: two fibers LIFO depth-first" {
             ctx.io.vtable.await(ctx.io.userdata, @ptrCast(&dummy), &.{}, .@"1");
             ctx.emit(Trace, 'B');
         }
-    }.body, mock_io, 0);
-    defer res1.fiber.deinit();
+    }.body, 0);
+    defer sched.destroyFiber(res1);
 
-    var res2 = try sched.createFiber(&struct {
+    const res2 = try sched.createFiber(&struct {
         fn body(ctx: *EffectContext) void {
             ctx.emit(Trace, '1');
             var dummy: DummyFuture = .{};
             ctx.io.vtable.await(ctx.io.userdata, @ptrCast(&dummy), &.{}, .@"1");
             ctx.emit(Trace, '2');
         }
-    }.body, mock_io, 0);
-    defer res2.fiber.deinit();
+    }.body, 0);
+    defer sched.destroyFiber(res2);
 
     var handlers = HandlerSet.init(testing.allocator);
     defer handlers.deinit();
@@ -956,8 +978,8 @@ test "Scheduler: two fibers LIFO depth-first" {
         }
     }.handle, null);
 
-    try sched.spawn(&res1.fiber, res1.handle, &handlers);
-    try sched.spawn(&res2.fiber, res2.handle, &handlers);
+    try sched.spawn(res1, &handlers);
+    try sched.spawn(res2, &handlers);
     sched.run();
 
     // Both fibers should complete
@@ -993,8 +1015,9 @@ test "Scheduler: IO combined with algebraic effects" {
 
     var sched = try Scheduler.init(testing.allocator, 1);
     defer sched.deinit();
+    sched.setIo(mock_io);
 
-    var res = try sched.createFiber(&struct {
+    const res = try sched.createFiber(&struct {
         fn body(ctx: *EffectContext) void {
             // Perform an algebraic effect
             const val = ctx.perform(GetVal, {});
@@ -1004,8 +1027,8 @@ test "Scheduler: IO combined with algebraic effects" {
             // Emit the result
             ctx.emit(Result, val * 2);
         }
-    }.body, mock_io, 0);
-    defer res.fiber.deinit();
+    }.body, 0);
+    defer sched.destroyFiber(res);
 
     const cont_mod = @import("effect/cont.zig");
 
@@ -1022,7 +1045,7 @@ test "Scheduler: IO combined with algebraic effects" {
         }
     }.handle, null);
 
-    try sched.spawn(&res.fiber, res.handle, &handlers);
+    try sched.spawn(res, &handlers);
     sched.run();
 
     try testing.expectEqual(@as(i32, 42), State.result);
@@ -1035,9 +1058,6 @@ test "Scheduler: IO combined with algebraic effects" {
 
 test "Scheduler: 100 fibers, 4 workers, atomic counter" {
     const N = 100;
-
-    var mock_vt = makeNoopVtable();
-    const mock_io = std.Io{ .userdata = null, .vtable = &mock_vt };
 
     const BenchPerform = types.Perform(u64, u64);
     const cont_mod = @import("effect/cont.zig");
@@ -1055,7 +1075,7 @@ test "Scheduler: 100 fibers, 4 workers, atomic counter" {
         }
     }.handle, null);
 
-    var results: [N]FiberResult = undefined;
+    var results: [N]*Scheduler.FiberEntry = undefined;
     for (0..N) |i| {
         results[i] = try sched.createFiber(&struct {
             fn body(ctx: *EffectContext) void {
@@ -1063,8 +1083,8 @@ test "Scheduler: 100 fibers, 4 workers, atomic counter" {
                 const r = ctx.perform(BenchPerform, 0);
                 std.mem.doNotOptimizeAway(r);
             }
-        }.body, mock_io, 0);
-        try sched.spawn(&results[i].fiber, results[i].handle, &handlers);
+        }.body, 0);
+        try sched.spawn(results[i], &handlers);
         // Atomic inc for each fiber that will complete
         _ = @atomicRmw(isize, &counter, .Add, 0, .monotonic); // just to reference counter
     }
@@ -1074,7 +1094,7 @@ test "Scheduler: 100 fibers, 4 workers, atomic counter" {
     // All fibers should be dead
     for (0..N) |i| {
         try testing.expect(!results[i].fiber.isAlive());
-        results[i].fiber.deinit();
+        sched.destroyFiber(results[i]);
     }
 }
 
@@ -1086,9 +1106,6 @@ test "Scheduler: zero fibers, run returns immediately" {
 }
 
 test "Scheduler: two fibers, 2 workers, both complete" {
-    var mock_vt = makeNoopVtable();
-    const mock_io = std.Io{ .userdata = null, .vtable = &mock_vt };
-
     const BenchPerform = types.Perform(u64, u64);
     const cont_mod = @import("effect/cont.zig");
 
@@ -1103,32 +1120,32 @@ test "Scheduler: two fibers, 2 workers, both complete" {
         }
     }.handle, null);
 
-    var res1 = try sched.createFiber(&struct {
+    const res1 = try sched.createFiber(&struct {
         fn body(ctx: *EffectContext) void {
             for (0..100) |i| {
                 const r = ctx.perform(BenchPerform, i);
                 std.mem.doNotOptimizeAway(r);
             }
         }
-    }.body, mock_io, 0);
+    }.body, 0);
 
-    var res2 = try sched.createFiber(&struct {
+    const res2 = try sched.createFiber(&struct {
         fn body(ctx: *EffectContext) void {
             for (0..100) |i| {
                 const r = ctx.perform(BenchPerform, i);
                 std.mem.doNotOptimizeAway(r);
             }
         }
-    }.body, mock_io, 0);
+    }.body, 0);
 
-    try sched.spawn(&res1.fiber, res1.handle, &handlers);
-    try sched.spawn(&res2.fiber, res2.handle, &handlers);
+    try sched.spawn(res1, &handlers);
+    try sched.spawn(res2, &handlers);
     sched.run();
 
     try testing.expect(!res1.fiber.isAlive());
     try testing.expect(!res2.fiber.isAlive());
-    res1.fiber.deinit();
-    res2.fiber.deinit();
+    sched.destroyFiber(res1);
+    sched.destroyFiber(res2);
 }
 
 // ============================================================
@@ -1155,28 +1172,29 @@ test "Scheduler: IO does not block worker" {
 
     var sched = try Scheduler.init(testing.allocator, 1);
     defer sched.deinit();
+    sched.setIo(mock_io);
 
-    var res1 = try sched.createFiber(&struct {
+    const res1 = try sched.createFiber(&struct {
         fn body(ctx: *EffectContext) void {
             var dummy: DummyFuture = .{};
             ctx.io.vtable.await(ctx.io.userdata, @ptrCast(&dummy), &.{}, .@"1");
         }
-    }.body, mock_io, 0);
-    defer res1.fiber.deinit();
+    }.body, 0);
+    defer sched.destroyFiber(res1);
 
-    var res2 = try sched.createFiber(&struct {
+    const res2 = try sched.createFiber(&struct {
         fn body(ctx: *EffectContext) void {
             var dummy: DummyFuture = .{};
             ctx.io.vtable.await(ctx.io.userdata, @ptrCast(&dummy), &.{}, .@"1");
         }
-    }.body, mock_io, 0);
-    defer res2.fiber.deinit();
+    }.body, 0);
+    defer sched.destroyFiber(res2);
 
     var handlers = HandlerSet.init(testing.allocator);
     defer handlers.deinit();
 
-    try sched.spawn(&res1.fiber, res1.handle, &handlers);
-    try sched.spawn(&res2.fiber, res2.handle, &handlers);
+    try sched.spawn(res1, &handlers);
+    try sched.spawn(res2, &handlers);
 
     var t_start: std.c.timespec = undefined;
     _ = std.c.clock_gettime(.MONOTONIC, &t_start);
@@ -1215,16 +1233,17 @@ test "Scheduler: IO + effects interleaved" {
 
     var sched = try Scheduler.init(testing.allocator, 1);
     defer sched.deinit();
+    sched.setIo(mock_io);
 
-    var res = try sched.createFiber(&struct {
+    const res = try sched.createFiber(&struct {
         fn body(ctx: *EffectContext) void {
             const val = ctx.perform(GetVal, {});
             var dummy: DummyFuture = .{};
             ctx.io.vtable.await(ctx.io.userdata, @ptrCast(&dummy), &.{}, .@"1");
             ctx.emit(Result, val * 3);
         }
-    }.body, mock_io, 0);
-    defer res.fiber.deinit();
+    }.body, 0);
+    defer sched.destroyFiber(res);
 
     var handlers = HandlerSet.init(testing.allocator);
     defer handlers.deinit();
@@ -1239,7 +1258,7 @@ test "Scheduler: IO + effects interleaved" {
         }
     }.handle, null);
 
-    try sched.spawn(&res.fiber, res.handle, &handlers);
+    try sched.spawn(res, &handlers);
     sched.run();
 
     try testing.expectEqual(@as(i32, 21), State.result);
@@ -1263,21 +1282,22 @@ test "Scheduler: multiple IO awaits per fiber" {
 
     var sched = try Scheduler.init(testing.allocator, 1);
     defer sched.deinit();
+    sched.setIo(mock_io);
 
-    var res = try sched.createFiber(&struct {
+    const res = try sched.createFiber(&struct {
         fn body(ctx: *EffectContext) void {
             for (0..3) |_| {
                 var dummy: DummyFuture = .{};
                 ctx.io.vtable.await(ctx.io.userdata, @ptrCast(&dummy), &.{}, .@"1");
             }
         }
-    }.body, mock_io, 0);
-    defer res.fiber.deinit();
+    }.body, 0);
+    defer sched.destroyFiber(res);
 
     var handlers = HandlerSet.init(testing.allocator);
     defer handlers.deinit();
 
-    try sched.spawn(&res.fiber, res.handle, &handlers);
+    try sched.spawn(res, &handlers);
     sched.run();
 
     try testing.expectEqual(@as(u32, 3), State.await_count.load(.acquire));
@@ -1302,19 +1322,20 @@ test "Scheduler: IO with multicore" {
 
     var sched = try Scheduler.init(testing.allocator, 4);
     defer sched.deinit();
+    sched.setIo(mock_io);
 
     var handlers = HandlerSet.init(testing.allocator);
     defer handlers.deinit();
 
-    var results: [N]FiberResult = undefined;
+    var results: [N]*Scheduler.FiberEntry = undefined;
     for (0..N) |i| {
         results[i] = try sched.createFiber(&struct {
             fn body(ctx: *EffectContext) void {
                 var dummy: DummyFuture = .{};
                 ctx.io.vtable.await(ctx.io.userdata, @ptrCast(&dummy), &.{}, .@"1");
             }
-        }.body, mock_io, 0);
-        try sched.spawn(&results[i].fiber, results[i].handle, &handlers);
+        }.body, 0);
+        try sched.spawn(results[i], &handlers);
     }
 
     sched.run();
@@ -1322,7 +1343,7 @@ test "Scheduler: IO with multicore" {
     try testing.expectEqual(@as(u32, N), State.completed.load(.acquire));
     for (0..N) |i| {
         try testing.expect(!results[i].fiber.isAlive());
-        results[i].fiber.deinit();
+        sched.destroyFiber(results[i]);
     }
 }
 
@@ -1332,9 +1353,6 @@ test "Scheduler: IO with multicore" {
 
 test "Scheduler: early wake resumes immediately" {
     // Fiber calls wake() before park() — scheduler sees WOKEN, resumes immediately.
-    var mock_vt = makeNoopVtable();
-    const mock_io = std.Io{ .userdata = null, .vtable = &mock_vt };
-
     const Done = types.Emit(u32);
 
     const State = struct {
@@ -1345,15 +1363,15 @@ test "Scheduler: early wake resumes immediately" {
     var sched = try Scheduler.init(testing.allocator, 1);
     defer sched.deinit();
 
-    var res = try sched.createFiber(&struct {
+    const res = try sched.createFiber(&struct {
         fn body(ctx: *EffectContext) void {
             var wh: WakeHandle = .{};
             wh.wake(); // early wake: INIT → WOKEN
             ctx.park(&wh); // scheduler sees WOKEN → resumes immediately
             ctx.emit(Done, 42);
         }
-    }.body, mock_io, 0);
-    defer res.fiber.deinit();
+    }.body, 0);
+    defer sched.destroyFiber(res);
 
     var handlers = HandlerSet.init(testing.allocator);
     defer handlers.deinit();
@@ -1363,7 +1381,7 @@ test "Scheduler: early wake resumes immediately" {
         }
     }.handle, null);
 
-    try sched.spawn(&res.fiber, res.handle, &handlers);
+    try sched.spawn(res, &handlers);
     sched.run();
 
     try testing.expectEqual(@as(u32, 42), State.value);
@@ -1372,9 +1390,6 @@ test "Scheduler: early wake resumes immediately" {
 
 test "Scheduler: park + wake from another fiber" {
     // Fiber A parks. Fiber B wakes it (possibly early wake). Fiber A resumes and emits.
-    var mock_vt = makeNoopVtable();
-    const mock_io = std.Io{ .userdata = null, .vtable = &mock_vt };
-
     const Done = types.Emit(u32);
 
     const Shared = struct {
@@ -1388,24 +1403,24 @@ test "Scheduler: park + wake from another fiber" {
     defer sched.deinit();
 
     // Fiber A: park, emit after resume
-    var res_a = try sched.createFiber(&struct {
+    const res_a = try sched.createFiber(&struct {
         fn body(ctx: *EffectContext) void {
             ctx.park(&Shared.wh);
             ctx.emit(Done, 99);
         }
-    }.body, mock_io, 0);
-    defer res_a.fiber.deinit();
+    }.body, 0);
+    defer sched.destroyFiber(res_a);
 
     // Fiber B: sleep briefly then wake A
-    var res_b = try sched.createFiber(&struct {
+    const res_b = try sched.createFiber(&struct {
         fn body(_: *EffectContext) void {
             // Brief sleep to let scheduler process A's park
             var ts: std.c.timespec = .{ .sec = 0, .nsec = 5_000_000 }; // 5ms
             _ = std.c.nanosleep(&ts, null);
             Shared.wh.wake();
         }
-    }.body, mock_io, 0);
-    defer res_b.fiber.deinit();
+    }.body, 0);
+    defer sched.destroyFiber(res_b);
 
     var handlers = HandlerSet.init(testing.allocator);
     defer handlers.deinit();
@@ -1415,8 +1430,8 @@ test "Scheduler: park + wake from another fiber" {
         }
     }.handle, null);
 
-    try sched.spawn(&res_a.fiber, res_a.handle, &handlers);
-    try sched.spawn(&res_b.fiber, res_b.handle, &handlers);
+    try sched.spawn(res_a, &handlers);
+    try sched.spawn(res_b, &handlers);
     sched.run();
 
     try testing.expectEqual(@as(u32, 99), Shared.value);

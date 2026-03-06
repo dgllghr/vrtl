@@ -123,6 +123,7 @@ pub fn main(init: std.process.Init) !void {
     // -- Set up scheduler --
     var sched = try vrtl.Scheduler.init(alloc, NUM_WORKERS);
     defer sched.deinit();
+    sched.setIo(io);
 
     // -- Handlers --
     var handlers = vrtl.HandlerSet.init(alloc);
@@ -134,14 +135,14 @@ pub fn main(init: std.process.Init) !void {
     }.handle, null);
 
     // -- Spawn fibers --
-    var fibers: [NUM_FIBERS]vrtl.FiberResult = undefined;
+    var fibers: [NUM_FIBERS]*vrtl.Scheduler.FiberEntry = undefined;
     for (0..NUM_FIBERS) |i| {
-        fibers[i] = try sched.createFiber(&echoHandler, io, 0);
-        try sched.spawn(&fibers[i].fiber, fibers[i].handle, &handlers);
+        fibers[i] = try sched.createFiber(&echoHandler, 0);
+        try sched.spawn(fibers[i], &handlers);
     }
 
     // -- Run forever (until listener fd is closed / accept fails) --
     sched.run();
 
-    for (&fibers) |*f| f.fiber.deinit();
+    for (&fibers) |f| sched.destroyFiber(f);
 }

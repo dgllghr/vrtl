@@ -31,8 +31,6 @@ pub const HandlerSet = effect.HandlerSet;
 pub const run = effect.run;
 pub const Scheduler = effect.Scheduler;
 
-// IO scheduling
-pub const FiberResult = effect.FiberResult;
 
 // Continuations (used in handler signatures)
 pub const Cont = effect.Cont;
@@ -110,10 +108,11 @@ test "Scheduler: nested handler chain with multi-file IO across fibers" {
     // -- Scheduler (must exist before creating IO fibers) --
     var sched = try Scheduler.init(testing.allocator, 1);
     defer sched.deinit();
+    sched.setIo(mock_io);
 
     // -- Fibers --
     // Fiber A: reads "config.json", writes it, reads "schema.json", writes it.
-    var res_a = try sched.createFiber(&struct {
+    const res_a = try sched.createFiber(&struct {
         fn body(ctx: *EffectContext) void {
             const cfg = ctx.perform(ReadFile, "config.json");
             _ = cfg; // contents received from handler
@@ -128,11 +127,11 @@ test "Scheduler: nested handler chain with multi-file IO across fibers" {
             ctx.io.vtable.await(ctx.io.userdata, @ptrCast(&dummy), &.{}, .@"1");
             ctx.emit(FileWritten, "schema.json");
         }
-    }.body, mock_io, 0);
-    defer res_a.fiber.deinit();
+    }.body, 0);
+    defer sched.destroyFiber(res_a);
 
     // Fiber B: reads "data.csv", writes it, reads "report.txt", writes it.
-    var res_b = try sched.createFiber(&struct {
+    const res_b = try sched.createFiber(&struct {
         fn body(ctx: *EffectContext) void {
             const data = ctx.perform(ReadFile, "data.csv");
             _ = data;
@@ -147,8 +146,8 @@ test "Scheduler: nested handler chain with multi-file IO across fibers" {
             ctx.io.vtable.await(ctx.io.userdata, @ptrCast(&dummy), &.{}, .@"1");
             ctx.emit(FileWritten, "report.txt");
         }
-    }.body, mock_io, 0);
-    defer res_b.fiber.deinit();
+    }.body, 0);
+    defer sched.destroyFiber(res_b);
 
     // -- Nested handler chain --
     //
@@ -196,8 +195,8 @@ test "Scheduler: nested handler chain with multi-file IO across fibers" {
     inner.setParent(&outer);
 
     // -- Run --
-    try sched.spawn(&res_a.fiber, res_a.handle, &inner);
-    try sched.spawn(&res_b.fiber, res_b.handle, &inner);
+    try sched.spawn(res_a, &inner);
+    try sched.spawn(res_b, &inner);
     sched.run();
 
     // -- Assertions --

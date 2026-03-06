@@ -44,16 +44,15 @@ pub const RawEffect = struct {
 pub const EffectFiber = fiber_mod.Fiber(RawEffect, void);
 pub const EffectBodyFn = *const fn (*EffectContext) void;
 
-/// Create an effect fiber from a body that receives an EffectContext
-/// directly. Equivalent to EffectFiber.init with a wrapper that
-/// constructs the context.
-pub fn initFiber(body: EffectBodyFn, stack_size: usize) !EffectFiber {
+/// Initialize an effect fiber in-place from a body that receives an
+/// EffectContext directly.
+pub fn initFiber(fiber: *EffectFiber, body: EffectBodyFn, stack_size: usize) !void {
     const Static = struct {
         threadlocal var current_body: EffectBodyFn = undefined;
     };
     Static.current_body = body;
 
-    return EffectFiber.init(&struct {
+    try fiber.init(&struct {
         fn wrapper(h: *EffectFiber.Handle) void {
             const b = Static.current_body;
             var ctx = EffectContext.init(h);
@@ -62,19 +61,19 @@ pub fn initFiber(body: EffectBodyFn, stack_size: usize) !EffectFiber {
     }.wrapper, stack_size);
 }
 
-/// Create an effect fiber with the default stack size.
-pub fn initFiberDefault(body: EffectBodyFn) !EffectFiber {
-    return initFiber(body, 0);
+/// Initialize an effect fiber in-place with the default stack size.
+pub fn initFiberDefault(fiber: *EffectFiber, body: EffectBodyFn) !void {
+    try initFiber(fiber, body, 0);
 }
 
-/// Create an effect fiber using a StackPool for allocation.
-pub fn initFiberPooled(pool: *@import("../pool.zig").StackPool, body: EffectBodyFn) !EffectFiber {
+/// Initialize an effect fiber in-place using a StackPool for allocation.
+pub fn initFiberPooled(fiber: *EffectFiber, pool: *@import("../pool.zig").StackPool, body: EffectBodyFn) !void {
     const Static = struct {
         threadlocal var current_body: EffectBodyFn = undefined;
     };
     Static.current_body = body;
 
-    return EffectFiber.initPooled(&struct {
+    try fiber.initPooled(&struct {
         fn wrapper(h: *EffectFiber.Handle) void {
             const b = Static.current_body;
             var ctx = EffectContext.init(h);

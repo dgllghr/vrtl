@@ -16,7 +16,7 @@ const coro = @import("coro.zig");
 
 pub fn Fiber(comptime YieldT: type, comptime ResumeT: type) type {
     return struct {
-        co: *coro.Coro,
+        co: coro.Coro = undefined,
         state: FiberState = .ready,
 
         const Self = @This();
@@ -71,10 +71,10 @@ pub fn Fiber(comptime YieldT: type, comptime ResumeT: type) type {
         };
 
         const Wrapper = struct {
-            fn entry(co: *coro.Coro) void {
+            fn entry(co_ptr: *coro.Coro) void {
                 const body_ptr: *const BodyFn = @ptrCast(@alignCast(
-                    coro.getUserData(co) orelse @panic("no user_data")));
-                var handle = Handle{ .co = co };
+                    coro.getUserData(co_ptr) orelse @panic("no user_data")));
+                var handle = Handle{ .co = co_ptr };
                 body_ptr.*(&handle);
             }
         };
@@ -86,44 +86,42 @@ pub fn Fiber(comptime YieldT: type, comptime ResumeT: type) type {
             threadlocal var current_body: BodyFn = undefined;
         };
 
-        /// Create a fiber that will run `body`.
-        pub fn init(body: BodyFn, stack_size: usize) !Self {
+        /// Initialize a fiber in-place that will run `body`.
+        pub fn init(self: *Self, body: BodyFn, stack_size: usize) !void {
             var desc = coro.descInit(Wrapper.entry, stack_size);
             Static.current_body = body;
             coro.setUserData(&desc, @ptrCast(&Static.current_body));
-            const co = try coro.create(&desc);
-            return Self{ .co = co };
+            try coro.create(&self.co, &desc);
+            self.state = .ready;
         }
 
-        /// Create a fiber using `pool` for stack allocation.
-        pub fn initPooled(body: BodyFn, stack_size: usize, pool: *@import("pool.zig").StackPool) !Self {
+        /// Initialize a fiber in-place using `pool` for stack allocation.
+        pub fn initPooled(self: *Self, body: BodyFn, stack_size: usize, pool: *@import("pool.zig").StackPool) !void {
             var desc = coro.descInit(Wrapper.entry, stack_size);
             Static.current_body = body;
             coro.setUserData(&desc, @ptrCast(&Static.current_body));
             pool.patchDesc(&desc);
-            const co = try coro.create(&desc);
-            return Self{ .co = co };
+            try coro.create(&self.co, &desc);
+            self.state = .ready;
         }
 
-        /// Create with default stack size (64KB).
-        pub fn initDefault(body: BodyFn) !Self {
-            return init(body, 0); // 0 = use default (64KB)
+        /// Initialize with default stack size (64KB).
+        pub fn initDefault(self: *Self, body: BodyFn) !void {
+            try self.init(body, 0);
         }
 
         /// Destroy the fiber and free its stack. Idempotent —
-        /// safe to call more than once (e.g. after a handler drops
-        /// the continuation).
+        /// safe to call more than once (coro.destroy checks block_size == 0).
         pub fn deinit(self: *Self) void {
-            if (self.state == .dead) return;
             self.state = .dead;
-            coro.destroy(self.co) catch {};
+            coro.destroy(&self.co) catch {};
         }
 
         /// Start the fiber for the first time (no resume value).
         /// Returns the first yielded value, or null if the fiber completed.
         pub fn start(self: *Self) ?YieldT {
             self.state = .running;
-            coro.@"resume"(self.co) catch {
+            coro.@"resume"(&self.co) catch {
                 self.state = .dead;
                 return null;
             };
@@ -136,7 +134,7 @@ pub fn Fiber(comptime YieldT: type, comptime ResumeT: type) type {
                 Slots.resume_ptr = &value;
             }
             self.state = .running;
-            coro.@"resume"(self.co) catch {
+            coro.@"resume"(&self.co) catch {
                 self.state = .dead;
                 return null;
             };
@@ -151,7 +149,7 @@ pub fn Fiber(comptime YieldT: type, comptime ResumeT: type) type {
                 Slots.resume_ptr = &value;
             }
             self.state = .running;
-            coro.@"resume"(self.co) catch {
+            coro.@"resume"(&self.co) catch {
                 self.state = .dead;
                 return null;
             };
@@ -162,7 +160,7 @@ pub fn Fiber(comptime YieldT: type, comptime ResumeT: type) type {
         pub fn resumeVoid(self: *Self) ?YieldT {
             if (self.state != .suspended) return null;
             self.state = .running;
-            coro.@"resume"(self.co) catch {
+            coro.@"resume"(&self.co) catch {
                 self.state = .dead;
                 return null;
             };
@@ -180,7 +178,7 @@ pub fn Fiber(comptime YieldT: type, comptime ResumeT: type) type {
         // -- Internal --
 
         fn afterResume(self: *Self) ?YieldT {
-            const s = coro.status(self.co);
+            const s = coro.status(&self.co);
             if (s == .suspended) {
                 self.state = .suspended;
                 if (comptime @sizeOf(YieldT) > 0) {
@@ -220,7 +218,8 @@ pub fn Transformer(comptime In: type, comptime Out: type) type {
 
 test "generator yields sequence then dies" {
     const Gen = Generator(i32);
-    var g = try Gen.initDefault(&struct {
+    var g: Gen = undefined;
+    try g.initDefault(&struct {
         fn body(h: *Gen.Handle) void {
             _ = h.yield(10);
             _ = h.yield(20);
@@ -238,7 +237,8 @@ test "generator yields sequence then dies" {
 
 test "fiber that immediately returns is dead after start" {
     const Gen = Generator(i32);
-    var g = try Gen.initDefault(&struct {
+    var g: Gen = undefined;
+    try g.initDefault(&struct {
         fn body(_: *Gen.Handle) void {}
     }.body);
     defer g.deinit();
@@ -249,7 +249,8 @@ test "fiber that immediately returns is dead after start" {
 
 test "bidirectional fiber passes values both ways" {
     const F = Fiber(i32, i32);
-    var f = try F.initDefault(&struct {
+    var f: F = undefined;
+    try f.initDefault(&struct {
         fn body(h: *F.Handle) void {
             const a = h.yield(1); // yield 1, receive first resume value
             const b = h.yield(a * 10); // echo it back scaled
@@ -271,7 +272,8 @@ test "consumer receives values via yieldVoid" {
     };
     State.sum = 0;
 
-    var c = try C.initDefault(&struct {
+    var c: C = undefined;
+    try c.initDefault(&struct {
         fn body(h: *C.Handle) void {
             State.sum += h.yieldVoid(); // suspend, wait for value
             State.sum += h.yieldVoid();
@@ -289,7 +291,8 @@ test "consumer receives values via yieldVoid" {
 
 test "resuming a non-suspended fiber returns null" {
     const Gen = Generator(i32);
-    var g = try Gen.initDefault(&struct {
+    var g: Gen = undefined;
+    try g.initDefault(&struct {
         fn body(h: *Gen.Handle) void {
             _ = h.yield(1);
         }
@@ -307,7 +310,8 @@ test "resuming a non-suspended fiber returns null" {
 
 test "state transitions" {
     const Gen = Generator(u8);
-    var g = try Gen.initDefault(&struct {
+    var g: Gen = undefined;
+    try g.initDefault(&struct {
         fn body(h: *Gen.Handle) void {
             _ = h.yield(1);
         }

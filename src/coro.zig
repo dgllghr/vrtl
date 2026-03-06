@@ -2,15 +2,15 @@
 //
 // Stack layout (per coroutine):
 //
-//   Low address                                      High address
-//   +──────────+───────────+──────────────────────────+
-//   │ Coro hdr │ Guard(16K)│        Usable Stack      │
-//   +──────────+───────────+──────────────────────────+
-//   ^                      ^                          ^
-//   block_base          stack_base               SP starts here
+//   Low address                                High address
+//   +───────────+──────────────────────────────+
+//   │ Guard(16K)│         Usable Stack         │
+//   +───────────+──────────────────────────────+
+//   ^           ^                              ^
+//   block_base  stack_base                SP starts here
 //
 // Guard page triggers SIGBUS on overflow. Stack grows downward.
-// Coro header lives at block start — pool recycles entire blocks.
+// Coro struct is owned by the caller (embedded in Fiber/FiberEntry).
 //
 // Context switch follows the pattern from Zig's standard library
 // (std.Io.fiber): minimal context (sp, fp, pc) with full clobber list.
@@ -47,6 +47,8 @@ pub const Desc = struct {
     alloc_fn: ?AllocFn = null,
     dealloc_fn: ?DeallocFn = null,
     allocator_data: ?*anyopaque = null,
+    /// Skip mprotect guard page setup (for recycled stacks that already have one).
+    skip_guard_page: bool = false,
 };
 
 pub const Coro = struct {
@@ -259,7 +261,7 @@ fn defaultDealloc(ptr: [*]u8, size: usize, _: ?*anyopaque) void {
 // §7. Guard page via mmap(MAP_FIXED)
 // ============================================================
 
-fn setGuardPage(addr: [*]align(std.heap.page_size_min) u8) !void {
+pub fn setGuardPage(addr: [*]align(std.heap.page_size_min) u8) !void {
     // Use mprotect to set PROT_NONE in-place. This keeps the original
     // mapping intact (unlike mmap(MAP_FIXED)), so munmap on the whole
     // block works correctly.
@@ -279,14 +281,13 @@ pub fn descInit(func: EntryFn, stack_size: usize) Desc {
     return .{ .func = func, .stack_size = stack_size };
 }
 
-pub fn create(desc: *Desc) CoroError!*Coro {
+pub fn create(co: *Coro, desc: *Desc) CoroError!void {
     const func = desc.func;
     const raw_stack = if (desc.stack_size == 0) DEFAULT_STACK_SIZE else desc.stack_size;
     const stack_size = std.mem.alignForward(usize, @max(raw_stack, MIN_STACK_SIZE), PAGE_SIZE);
 
-    // Block layout: [Coro header (page-aligned)] [guard page] [usable stack]
-    const header_size = std.mem.alignForward(usize, @sizeOf(Coro), PAGE_SIZE);
-    const block_size = header_size + PAGE_SIZE + stack_size;
+    // Block layout: [guard page] [usable stack]
+    const block_size = PAGE_SIZE + stack_size;
 
     const alloc_fn = desc.alloc_fn orelse &defaultAlloc;
     const dealloc_fn = desc.dealloc_fn orelse &defaultDealloc;
@@ -294,12 +295,10 @@ pub fn create(desc: *Desc) CoroError!*Coro {
 
     const block_ptr = alloc_fn(block_size, alloc_data) orelse return CoroError.OutOfMemory;
 
-    // Place Coro at start of block
-    const co: *Coro = @ptrCast(@alignCast(block_ptr));
     co.* = .{
         .func = func,
         .user_data = desc.user_data,
-        .stack_base = block_ptr + header_size + PAGE_SIZE,
+        .stack_base = block_ptr + PAGE_SIZE,
         .stack_size = stack_size,
         .block_base = block_ptr,
         .block_size = block_size,
@@ -307,11 +306,12 @@ pub fn create(desc: *Desc) CoroError!*Coro {
         .dealloc_data = alloc_data,
     };
 
-    // Set guard page (between header and usable stack)
-    setGuardPage(@alignCast(block_ptr + header_size)) catch {};
+    // Set guard page at block start — skip for recycled blocks
+    if (!desc.skip_guard_page) {
+        setGuardPage(@alignCast(block_ptr)) catch {};
+    }
 
     makeContext(co);
-    return co;
 }
 
 pub fn @"resume"(co: *Coro) CoroError!void {
@@ -337,10 +337,12 @@ pub fn yield(co: *Coro) CoroError!void {
 }
 
 pub fn destroy(co: *Coro) CoroError!void {
+    if (co.block_size == 0) return; // already destroyed
     const dealloc = co.dealloc_fn orelse &defaultDealloc;
     const data = co.dealloc_data;
     const block = co.block_base;
     const size = co.block_size;
+    co.block_size = 0;
     dealloc(block, size, data);
 }
 
@@ -371,14 +373,15 @@ test "basic context switch" {
             yield(co) catch unreachable;
         }
     }.body, 0);
-    const co = try create(&desc);
-    defer destroy(co) catch {};
+    var co: Coro = undefined;
+    try create(&co, &desc);
+    defer destroy(&co) catch {};
 
-    try @"resume"(co);
+    try @"resume"(&co);
     try std.testing.expectEqual(State.suspended, co.state);
-    try @"resume"(co);
+    try @"resume"(&co);
     try std.testing.expectEqual(State.suspended, co.state);
-    try @"resume"(co);
+    try @"resume"(&co);
     try std.testing.expectEqual(State.dead, co.state);
 }
 
@@ -390,21 +393,23 @@ test "nested coroutines" {
                     yield(ico) catch unreachable;
                 }
             }.inner, 0);
-            const inner = create(&desc) catch unreachable;
-            defer destroy(inner) catch {};
+            var inner: Coro = undefined;
+            create(&inner, &desc) catch unreachable;
+            defer destroy(&inner) catch {};
 
-            @"resume"(inner) catch unreachable;
+            @"resume"(&inner) catch unreachable;
             yield(co) catch unreachable;
-            @"resume"(inner) catch unreachable;
+            @"resume"(&inner) catch unreachable;
         }
     }.body, 0);
 
-    const outer = try create(&outer_desc);
-    defer destroy(outer) catch {};
+    var outer: Coro = undefined;
+    try create(&outer, &outer_desc);
+    defer destroy(&outer) catch {};
 
-    try @"resume"(outer);
+    try @"resume"(&outer);
     try std.testing.expectEqual(State.suspended, outer.state);
-    try @"resume"(outer);
+    try @"resume"(&outer);
     try std.testing.expectEqual(State.dead, outer.state);
 }
 
@@ -417,13 +422,14 @@ test "callee-saved register preservation (1M round-trips)" {
             }
         }
     }.body, 0);
-    const co = try create(&desc);
-    defer destroy(co) catch {};
+    var co: Coro = undefined;
+    try create(&co, &desc);
+    defer destroy(&co) catch {};
 
     for (0..ITERS) |_| {
-        try @"resume"(co);
+        try @"resume"(&co);
     }
-    try @"resume"(co);
+    try @"resume"(&co);
     try std.testing.expectEqual(State.dead, co.state);
 }
 
@@ -436,10 +442,11 @@ test "user_data round-trip" {
         }
     }.body, 0);
     setUserData(&desc, @ptrCast(&payload));
-    const co = try create(&desc);
-    defer destroy(co) catch {};
+    var co: Coro = undefined;
+    try create(&co, &desc);
+    defer destroy(&co) catch {};
 
-    try @"resume"(co);
+    try @"resume"(&co);
     try std.testing.expectEqual(@as(u64, 43), payload);
 }
 
@@ -450,11 +457,12 @@ test "threadlocal running()" {
             yield(co) catch unreachable;
         }
     }.body, 0);
-    const co = try create(&desc);
-    defer destroy(co) catch {};
+    var co: Coro = undefined;
+    try create(&co, &desc);
+    defer destroy(&co) catch {};
 
     try std.testing.expectEqual(@as(?*Coro, null), running());
-    try @"resume"(co);
+    try @"resume"(&co);
     try std.testing.expectEqual(@as(?*Coro, null), running());
-    try @"resume"(co);
+    try @"resume"(&co);
 }
