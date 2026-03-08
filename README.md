@@ -78,7 +78,7 @@ handlers.onPerform(ReadFile, &struct {
 }.handle, null);
 
 handlers.onEmit(Log, &struct {
-    fn handle(msg: *const Log.Value, _: ?*anyopaque) void {
+    fn handle(msg: *const Log.Value, _: *vt.EffectContext, _: ?*anyopaque) void {
         std.debug.print("{s}\n", .{msg.*});
     }
 }.handle, null);

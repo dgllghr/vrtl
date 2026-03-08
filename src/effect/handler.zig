@@ -20,7 +20,7 @@ pub fn PerformSyncHandlerFn(comptime E: type) type {
 }
 
 pub fn EmitHandlerFn(comptime E: type) type {
-    return *const fn (value: *const E.Value, ctx: ?*anyopaque) void;
+    return *const fn (value: *const E.Value, ctx: *EffectContext, user_ctx: ?*anyopaque) void;
 }
 
 pub fn PerformHandlerFn(comptime E: type) type {
@@ -42,7 +42,6 @@ pub const PerformResult = union(enum) {
 };
 
 const ErasedPerformFn = *const fn (raw: *const RawEffect, fiber: *EffectFiber, ctx: ?*anyopaque) PerformResult;
-const ErasedEmitFn = *const fn (raw: *const RawEffect, ctx: ?*anyopaque) void;
 
 const PerformBinding = struct {
     id: usize,
@@ -50,9 +49,16 @@ const PerformBinding = struct {
     ctx: ?*anyopaque,
 };
 
+pub const EmitFiberCtx = struct {
+    value_ptr: *anyopaque,
+    user_ctx: ?*anyopaque,
+};
+
+pub threadlocal var emit_fiber_ctx_tls: EmitFiberCtx = undefined;
+
 const EmitBinding = struct {
     id: usize,
-    handler: ErasedEmitFn,
+    fiber_body: EffectBodyFn,
     ctx: ?*anyopaque,
 };
 
@@ -118,18 +124,25 @@ pub const HandlerSet = struct {
         }) catch @panic("OOM");
     }
 
-    /// Bind a typed emit observer. Compile error if handler
-    /// signature doesn't match E's value type.
+    /// Bind a typed emit observer. The handler runs in its own fiber
+    /// with an EffectContext, so it can suspend, re-emit, and re-perform.
     pub fn onEmit(self: *HandlerSet, comptime E: type, comptime handler: EmitHandlerFn(E), ctx: ?*anyopaque) void {
         const Gen = struct {
-            fn erased(raw: *const RawEffect, user_ctx: ?*anyopaque) void {
-                const val: *const E.Value = @ptrCast(@alignCast(raw.value_ptr));
-                handler(val, user_ctx);
+            fn fiber_body(ectx: *EffectContext) void {
+                const ectx_info = emit_fiber_ctx_tls;
+                var value_copy: E.Value = undefined;
+                if (@sizeOf(E.Value) > 0) {
+                    const src: *const E.Value = @ptrCast(@alignCast(ectx_info.value_ptr));
+                    value_copy = src.*;
+                }
+                // Signal: value copied, emitter can resume
+                _ = ectx.handle.yield(.{ .kind = .@"suspend" });
+                handler(&value_copy, ectx, ectx_info.user_ctx);
             }
         };
         self.emit_bindings.append(self.allocator, .{
             .id = effectId(E),
-            .handler = Gen.erased,
+            .fiber_body = Gen.fiber_body,
             .ctx = ctx,
         }) catch @panic("OOM");
     }

@@ -159,7 +159,7 @@ test "Scheduler: nested handler chain with multi-file IO across fibers" {
 
     // Inner: observe FileWritten
     inner.onEmit(FileWritten, &struct {
-        fn handle(val: *const FileWritten.Value, _: ?*anyopaque) void {
+        fn handle(val: *const FileWritten.Value, _: *EffectContext, _: ?*anyopaque) void {
             S.record(val.*);
         }
     }.handle, null);
@@ -184,7 +184,7 @@ test "Scheduler: nested handler chain with multi-file IO across fibers" {
 
     // Outer: also observe FileWritten (bubbles up from inner)
     outer.onEmit(FileWritten, &struct {
-        fn handle(val: *const FileWritten.Value, _: ?*anyopaque) void {
+        fn handle(val: *const FileWritten.Value, _: *EffectContext, _: ?*anyopaque) void {
             // Prefix to distinguish from inner observer
             _ = val;
             S.record("parent-saw-write");

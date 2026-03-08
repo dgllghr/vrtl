@@ -50,26 +50,7 @@ threadlocal var original_net_write_fn: *const NetWriteFn = undefined;
 /// Threadlocal for passing IO args from interceptAwait to the scheduler.
 threadlocal var pending_io: ?PendingIo = null;
 
-const MAX_EMIT_VALUE = 128;
-
-/// Threadlocal for passing emit observer context from processEntry to the observer body.
-const EmitObserverInfo = struct {
-    id: usize,
-    value_ptr: *anyopaque,
-    value_size: usize,
-    handlers: *const HandlerSet,
-};
-threadlocal var emit_observer_info: EmitObserverInfo = undefined;
-
-fn emitObserverBody(ectx: *EffectContext) void {
-    const info = emit_observer_info;
-    // Copy emit value to coroutine stack (zero heap alloc)
-    var value_buf: [MAX_EMIT_VALUE]u8 align(16) = undefined;
-    @memcpy(value_buf[0..info.value_size], @as([*]const u8, @ptrCast(info.value_ptr))[0..info.value_size]);
-    _ = ectx.handle.yield(.{ .kind = .@"suspend" });
-    const eff = RawEffect{ .id = info.id, .kind = .emit, .value_ptr = @ptrCast(&value_buf), .value_size = 0 };
-    dispatch_mod.dispatchEmit(&eff, info.handlers);
-}
+const EmitFiberCtx = handler_mod.EmitFiberCtx;
 
 
 fn interceptAwait(userdata: ?*anyopaque, future: *std.Io.AnyFuture, result_buf: []u8, alignment: std.mem.Alignment) void {
@@ -347,15 +328,7 @@ pub const Worker = struct {
                 // Fall through to the dispatch loop below
             } else {
                 // Dead fiber — clean up
-                entry.fiber.deinit();
-                if (entry.owns_entry) {
-                    self.freeObserver(entry);
-                }
-                const prev = @atomicRmw(isize, &sched.live_fibers, .Sub, 1, .release);
-                if (prev <= 1) {
-                    @atomicStore(u32, &sched.shutdown, 1, .release);
-                    sched.wakeAll();
-                }
+                self.completeFiber(entry);
                 return;
             }
         }
@@ -366,13 +339,20 @@ pub const Worker = struct {
             switch (eff.kind) {
                 .perform => {
                     activateFiber(entry);
-                    entry.pending_effect = self.dispatchPerformScheduled(&eff, &entry.fiber, entry.handlers);
+                    const result = self.dispatchPerformScheduled(&eff, entry, entry.handlers);
                     captureFiber(entry);
                     entry.pending_io = pending_io;
                     pending_io = null;
+                    switch (result) {
+                        .parked => return, // Origin parked by async handler
+                        .effect => |next| entry.pending_effect = next,
+                    }
                 },
                 .emit => {
-                    dispatch_mod.dispatchEmit(&eff, entry.handlers);
+                    // Spawn real handler fibers for each matching emit binding.
+                    // Each handler copies the value to its coroutine stack before
+                    // yielding, so the emitter can safely resume after all copies.
+                    self.spawnEmitHandlers(&eff, entry.handlers);
                     activateFiber(entry);
                     entry.pending_effect = entry.fiber.resumeVoid();
                     captureFiber(entry);
@@ -420,6 +400,37 @@ pub const Worker = struct {
         }
 
         // pending_effect is null — fiber completed
+        self.completeFiber(entry);
+    }
+
+    /// Clean up a completed fiber. If it's a handler fiber, handle the
+    /// perform outcome (resume/drop/delegate origin).
+    fn completeFiber(self: *Worker, entry: *FiberEntry) void {
+        const sched = self.parent;
+
+        // Check if this was a handler fiber for an effectful perform
+        if (entry.origin_entry != null) {
+            // Capture state before freeing the entry
+            const handler_ctx = entry.handler_ctx;
+            const origin = entry.origin_entry.?;
+            const original_effect = entry.original_effect;
+            const next_level = entry.next_level;
+            const next_binding_idx = entry.next_binding_idx;
+            entry.fiber.deinit();
+            if (entry.owns_entry) {
+                self.freeObserver(entry);
+            }
+            _ = @atomicRmw(isize, &sched.live_fibers, .Sub, 1, .release);
+            // Handle the origin fiber's fate
+            self.handlePerformHandlerCompletion(origin, handler_ctx, original_effect, next_level, next_binding_idx);
+            // Check shutdown after handler completion (origin may have been re-enqueued)
+            if (@atomicLoad(isize, &sched.live_fibers, .acquire) <= 0) {
+                @atomicStore(u32, &sched.shutdown, 1, .release);
+                sched.wakeAll();
+            }
+            return;
+        }
+
         entry.fiber.deinit();
         if (entry.owns_entry) {
             self.freeObserver(entry);
@@ -571,73 +582,217 @@ pub const Worker = struct {
         self.workerLoop();
     }
 
+    /// Spawn real emit handler fibers for each matching binding in the chain.
+    /// Each fiber copies the emit value to its coroutine stack, yields once
+    /// (so the emitter can resume), then runs the handler with full effect support.
+    /// Handlers that complete synchronously are run inline without deque overhead.
+    fn spawnEmitHandlers(self: *Worker, eff: *const RawEffect, handlers: *const HandlerSet) void {
+        const sched = self.parent;
+        var level: ?*const HandlerSet = handlers;
+        while (level) |hs| : (level = hs.parent) {
+            for (hs.emit_bindings.items) |binding| {
+                if (binding.id == eff.id) {
+                    // Set TLS context for the fiber body
+                    handler_mod.emit_fiber_ctx_tls = .{
+                        .value_ptr = eff.value_ptr,
+                        .user_ctx = binding.ctx,
+                    };
+
+                    // Create handler fiber
+                    const h_entry = self.allocObserver();
+                    initFiberPooled(&h_entry.fiber, &self.pool, binding.fiber_body) catch @panic("OOM: emit handler fiber");
+
+                    // Start fiber — it copies value and yields suspend
+                    var next_eff = h_entry.fiber.start();
+
+                    // Skip the value-copy suspend
+                    if (next_eff) |fe| {
+                        if (fe.kind == .@"suspend") {
+                            next_eff = h_entry.fiber.resumeVoid();
+                        }
+                    }
+
+                    if (next_eff == null) {
+                        // === FAST PATH: handler completed synchronously ===
+                        h_entry.fiber.deinit();
+                        self.freeObserver(h_entry);
+                        continue;
+                    }
+
+                    // === SLOW PATH: handler yielded, needs async processing ===
+                    h_entry.owns_entry = true;
+                    h_entry.origin_entry = null; // not a perform handler
+                    h_entry.handlers = hs.parent orelse hs;
+                    h_entry.pending_effect = next_eff;
+                    h_entry.handle = active_fiber_handle;
+                    h_entry.pending_io = null;
+
+                    self.deque.push(h_entry) catch unreachable;
+                    _ = @atomicRmw(isize, &sched.live_fibers, .Add, 1, .monotonic);
+                }
+            }
+        }
+    }
+
     /// Walk the handler chain (child -> parent). At each level, try simple
-    /// bindings first, then effectful bindings. Effectful handlers run in
-    /// their own fibers; their effects are dispatched to the parent scope.
+    /// bindings first, then effectful bindings.
+    ///
+    /// Sync handlers run inline. Effectful handlers are spawned as real
+    /// scheduled fibers — the origin fiber is parked and resumed when the
+    /// handler completes.
+    ///
+    /// Returns `.effect` with the next effect (or null for completed),
+    /// or `.parked` if the origin was parked by an async handler.
+    const PerformDispatchResult = union(enum) {
+        effect: ?RawEffect,
+        parked,
+    };
+
     fn dispatchPerformScheduled(
         self: *Worker,
         eff: *const RawEffect,
-        origin_fiber: *EffectFiber,
+        origin_entry: *FiberEntry,
         handlers: ?*const HandlerSet,
-    ) ?RawEffect {
+    ) PerformDispatchResult {
+        return self.dispatchPerformFrom(eff, origin_entry, handlers, null, 0);
+    }
+
+    /// Inner dispatch that supports resuming from a specific position (for delegation).
+    fn dispatchPerformFrom(
+        self: *Worker,
+        eff: *const RawEffect,
+        origin_entry: *FiberEntry,
+        handlers: ?*const HandlerSet,
+        skip_level: ?*const HandlerSet,
+        skip_effectful_idx: usize,
+    ) PerformDispatchResult {
+        const sched = self.parent;
         var level: ?*const HandlerSet = handlers;
         while (level) |hs| : (level = hs.parent) {
-            // Simple bindings
+            // Simple bindings (always inline)
             for (hs.perform_bindings.items) |binding| {
                 if (binding.id == eff.id) {
-                    switch (binding.handler(eff, origin_fiber, binding.ctx)) {
-                        .handled => |next| return next,
+                    switch (binding.handler(eff, &origin_entry.fiber, binding.ctx)) {
+                        .handled => |next| return .{ .effect = next },
                         .skipped => {},
                     }
                 }
             }
 
-            // Effectful bindings
-            for (hs.effectful_bindings.items) |binding| {
-                if (binding.id == eff.id) {
-                    var hctx = HandlerFiberCtx{
-                        .raw = eff,
-                        .user_ctx = binding.ctx,
-                    };
-                    handler_mod.handler_fiber_ctx_tls = &hctx;
+            // Effectful bindings — try inline first, fall back to async scheduling
+            for (hs.effectful_bindings.items, 0..) |binding, idx| {
+                if (binding.id != eff.id) continue;
 
-                    var hfib: EffectFiber = undefined;
-                    initFiberPooled(&hfib, &self.pool, binding.fiber_body) catch @panic("OOM");
-                    defer hfib.deinit();
-
-                    // Run handler fiber — dispatch ITS effects to parent scope
-                    var heff = hfib.start();
-                    while (heff) |h| {
-                        switch (h.kind) {
-                            .emit => {
-                                if (hs.parent) |p| {
-                                    dispatch_mod.dispatchEmit(&h, p);
-                                }
-                                heff = hfib.resumeVoid();
-                            },
-                            .perform => {
-                                heff = self.dispatchPerformScheduled(&h, &hfib, hs.parent);
-                            },
-                            .@"suspend" => unreachable,
-                        }
-                    }
-
-                    // Handler fiber completed — check outcome
-                    if (hctx.delegated) continue;
-                    if (hctx.resumed) return origin_fiber.resumeVoid();
-                    if (hctx.dropped) {
-                        origin_fiber.deinit();
-                        return null;
-                    }
-                    // auto-drop
-                    origin_fiber.deinit();
-                    return null;
+                // Skip bindings we've already tried (delegation resume)
+                if (skip_level) |sl| {
+                    if (sl == hs and idx < skip_effectful_idx) continue;
                 }
+
+                // Set up handler context on a temp entry (lives with the entry)
+                const h_entry = self.allocObserver();
+                h_entry.handler_ctx = .{
+                    .raw = eff, // valid during start(); fiber copies what it needs
+                    .user_ctx = binding.ctx,
+                };
+                handler_mod.handler_fiber_ctx_tls = &h_entry.handler_ctx;
+                initFiberPooled(&h_entry.fiber, &self.pool, binding.fiber_body) catch @panic("OOM");
+
+                // Start the handler fiber
+                const first_eff = h_entry.fiber.start();
+
+                if (first_eff == null) {
+                    // === FAST PATH: handler completed synchronously ===
+                    // No heap alloc, no deque push — handle outcome inline.
+                    const ctx = h_entry.handler_ctx;
+                    h_entry.fiber.deinit();
+                    self.freeObserver(h_entry);
+
+                    if (ctx.delegated) continue; // try next binding
+                    if (ctx.resumed) return .{ .effect = origin_entry.fiber.resumeVoid() };
+                    // Dropped or auto-drop — deinit origin (completeFiber handles cleanup)
+                    origin_entry.fiber.deinit();
+                    return .{ .effect = null };
+                }
+
+                // === SLOW PATH: handler yielded, needs async scheduling ===
+                h_entry.origin_entry = origin_entry;
+                h_entry.original_effect = eff.*;
+                h_entry.next_level = hs;
+                h_entry.next_binding_idx = idx + 1;
+                // Point hctx.raw at the entry's stable copy (original eff may be stack-local)
+                h_entry.handler_ctx.raw = &h_entry.original_effect;
+
+                h_entry.owns_entry = true;
+                h_entry.handlers = hs.parent orelse hs;
+                h_entry.pending_effect = first_eff;
+                h_entry.handle = active_fiber_handle;
+                h_entry.pending_io = null;
+
+                // Push handler to deque, increment live_fibers
+                self.deque.push(h_entry) catch unreachable;
+                _ = @atomicRmw(isize, &sched.live_fibers, .Add, 1, .monotonic);
+
+                // Origin is parked — don't re-enqueue it
+                return .parked;
             }
         }
 
         // Chain exhausted — no handler accepted. Resume with zeroed value.
-        return origin_fiber.resumeVoid();
+        return .{ .effect = origin_entry.fiber.resumeVoid() };
+    }
+
+    /// Called when a handler fiber completes. Handles the Cont outcome
+    /// (resume/drop/delegate) for the origin fiber.
+    fn handlePerformHandlerCompletion(
+        self: *Worker,
+        origin: *FiberEntry,
+        ctx: HandlerFiberCtx,
+        original_effect: RawEffect,
+        next_level: ?*const HandlerSet,
+        next_binding_idx: usize,
+    ) void {
+        const sched = self.parent;
+
+        if (ctx.delegated) {
+            // Continue searching from the next binding.
+            // original_effect is a stack-local copy — stable for the call.
+            var eff_copy = original_effect;
+            const result = self.dispatchPerformFrom(
+                &eff_copy,
+                origin,
+                next_level,
+                next_level,
+                next_binding_idx,
+            );
+            switch (result) {
+                .parked => {}, // Another async handler took over
+                .effect => |next_eff| {
+                    origin.pending_effect = next_eff;
+                    origin.pending_io = null;
+                    self.deque.push(origin) catch unreachable;
+                },
+            }
+            return;
+        }
+
+        if (ctx.resumed) {
+            // Cont wrote the resume value. Re-enqueue origin.
+            origin.pending_effect = null;
+            origin.pending_io = null;
+            self.deque.push(origin) catch unreachable;
+            return;
+        }
+
+        // Dropped or auto-drop — destroy origin fiber
+        origin.fiber.deinit();
+        if (origin.owns_entry) {
+            self.freeObserver(origin);
+        }
+        const prev = @atomicRmw(isize, &sched.live_fibers, .Sub, 1, .release);
+        if (prev <= 1) {
+            @atomicStore(u32, &sched.shutdown, 1, .release);
+            sched.wakeAll();
+        }
     }
 };
 
@@ -679,6 +834,16 @@ pub const Scheduler = struct {
         /// If true, scheduler frees this entry on fiber death (observer fibers).
         /// User-created entries (from createFiber) are false — user calls destroyFiber.
         owns_entry: bool = false,
+        /// Handler outcome flags — lives on the entry so the fiber's pointer
+        /// to it (captured via TLS at start) remains valid for the entry's lifetime.
+        handler_ctx: HandlerFiberCtx = .{ .raw = undefined, .user_ctx = null },
+        /// Non-null for effectful perform handler fibers: the origin fiber's entry.
+        origin_entry: ?*FiberEntry = null,
+        /// Original effect — needed for re-dispatch on delegation.
+        original_effect: RawEffect = undefined,
+        /// Where to continue searching if handler delegates.
+        next_level: ?*const HandlerSet = null,
+        next_binding_idx: usize = 0,
     };
 
     /// Initialize a scheduler with `num_workers` workers.
@@ -790,6 +955,8 @@ pub const Scheduler = struct {
         entry.handle = handle;
         entry.pending_effect = null;
         entry.pending_io = null;
+        entry.owns_entry = false;
+        entry.origin_entry = null;
 
         return entry;
     }
@@ -910,7 +1077,7 @@ test "Scheduler: single fiber yields on await then completes" {
     var handlers = HandlerSet.init(testing.allocator);
     defer handlers.deinit();
     handlers.onEmit(Result, &struct {
-        fn handle(val: *const Result.Value, raw_ctx: ?*anyopaque) void {
+        fn handle(val: *const Result.Value, _: *EffectContext, raw_ctx: ?*anyopaque) void {
             const r: *usize = @ptrCast(@alignCast(raw_ctx.?));
             r.* = val.*;
         }
@@ -972,7 +1139,7 @@ test "Scheduler: two fibers LIFO depth-first" {
     var handlers = HandlerSet.init(testing.allocator);
     defer handlers.deinit();
     handlers.onEmit(Trace, &struct {
-        fn handle(val: *const Trace.Value, _: ?*anyopaque) void {
+        fn handle(val: *const Trace.Value, _: *EffectContext, _: ?*anyopaque) void {
             State.order[State.idx] = val.*;
             State.idx += 1;
         }
@@ -1040,7 +1207,7 @@ test "Scheduler: IO combined with algebraic effects" {
         }
     }.handle, null);
     handlers.onEmit(Result, &struct {
-        fn handle(val: *const Result.Value, _: ?*anyopaque) void {
+        fn handle(val: *const Result.Value, _: *EffectContext, _: ?*anyopaque) void {
             State.result = val.*;
         }
     }.handle, null);
@@ -1253,7 +1420,7 @@ test "Scheduler: IO + effects interleaved" {
         }
     }.handle, null);
     handlers.onEmit(Result, &struct {
-        fn handle(val: *const Result.Value, _: ?*anyopaque) void {
+        fn handle(val: *const Result.Value, _: *EffectContext, _: ?*anyopaque) void {
             State.result = val.*;
         }
     }.handle, null);
@@ -1376,7 +1543,7 @@ test "Scheduler: early wake resumes immediately" {
     var handlers = HandlerSet.init(testing.allocator);
     defer handlers.deinit();
     handlers.onEmit(Done, &struct {
-        fn handle(val: *const Done.Value, _: ?*anyopaque) void {
+        fn handle(val: *const Done.Value, _: *EffectContext, _: ?*anyopaque) void {
             State.value = val.*;
         }
     }.handle, null);
@@ -1425,7 +1592,7 @@ test "Scheduler: suspend + wake from another fiber" {
     var handlers = HandlerSet.init(testing.allocator);
     defer handlers.deinit();
     handlers.onEmit(Done, &struct {
-        fn handle(val: *const Done.Value, _: ?*anyopaque) void {
+        fn handle(val: *const Done.Value, _: *EffectContext, _: ?*anyopaque) void {
             Shared.value = val.*;
         }
     }.handle, null);

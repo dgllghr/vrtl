@@ -129,7 +129,7 @@ pub fn main(init: std.process.Init) !void {
     var handlers = vrtl.HandlerSet.init(alloc);
     defer handlers.deinit();
     handlers.onEmit(Log, &struct {
-        fn handle(msg: *const []const u8, _: ?*anyopaque) void {
+        fn handle(msg: *const []const u8, _: *vrtl.EffectContext, _: ?*anyopaque) void {
             std.debug.print("[log] {s}\n", .{msg.*});
         }
     }.handle, null);

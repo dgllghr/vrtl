@@ -4,6 +4,7 @@ const handler_mod = @import("handler.zig");
 
 const RawEffect = types.RawEffect;
 const EffectFiber = types.EffectFiber;
+const EffectContext = types.EffectContext;
 const HandlerSet = handler_mod.HandlerSet;
 
 // ============================================================
@@ -30,13 +31,43 @@ pub fn dispatchPerform(eff: *const RawEffect, fiber: *EffectFiber, handlers: *co
 }
 
 /// Walk the entire handler chain, calling ALL matching emit observers at
-/// every level. Child-level observers run first, then parent, then grandparent.
+/// every level. Each observer runs in a temp fiber inline (for run() mode).
 pub fn dispatchEmit(eff: *const RawEffect, handlers: *const HandlerSet) void {
     var level: ?*const HandlerSet = handlers;
     while (level) |hs| : (level = hs.parent) {
         for (hs.emit_bindings.items) |binding| {
             if (binding.id == eff.id) {
-                binding.handler(eff, binding.ctx);
+                handler_mod.emit_fiber_ctx_tls = .{
+                    .value_ptr = eff.value_ptr,
+                    .user_ctx = binding.ctx,
+                };
+                var hfib: EffectFiber = undefined;
+                types.initFiberDefault(&hfib, binding.fiber_body) catch @panic("OOM: emit handler fiber");
+                defer hfib.deinit();
+
+                // Start fiber — it copies value to its stack and yields suspend
+                var heff = hfib.start();
+                // Skip the initial suspend (value copy done)
+                if (heff) |h| {
+                    if (h.kind == .@"suspend") {
+                        heff = hfib.resumeVoid();
+                    }
+                }
+                // Process handler's effects inline
+                while (heff) |h| {
+                    switch (h.kind) {
+                        .emit => {
+                            if (hs.parent) |p| {
+                                dispatchEmit(&h, p);
+                            }
+                            heff = hfib.resumeVoid();
+                        },
+                        .perform => {
+                            heff = dispatchPerform(&h, &hfib, hs.parent orelse hs);
+                        },
+                        .@"suspend" => unreachable,
+                    }
+                }
             }
         }
     }

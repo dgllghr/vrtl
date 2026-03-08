@@ -45,6 +45,7 @@ pub fn main() void {
     bench(p, "emit dispatch (sched, async)", 10_000, benchEmitDispatch);
     bench(p, "perform dispatch", 1_000_000, benchPerformDispatch);
     bench(p, "effectful perform (sched)", 10_000, benchEffectfulPerform);
+    bench(p, "effectful perform slow (sched)", 10_000, benchEffectfulPerformSlow);
     bench(p, "perform dispatch (sched, 1W)", 100_000, benchScheduler);
     bench(p, "perform dispatch (sched, 4W)", 100_000, benchSchedulerMulticore);
     bench(p, "deque push/pop", 1_000_000, benchDequePushPop);
@@ -177,7 +178,7 @@ fn benchEmitDispatch(iters: usize) u64 {
 
     var handlers = HandlerSet.init(allocator);
     handlers.onEmit(BenchEmit, &struct {
-        fn handle(_: *const BenchEmit.Value, ctx: ?*anyopaque) void {
+        fn handle(_: *const BenchEmit.Value, _: *EffectContext, ctx: ?*anyopaque) void {
             const c: *u64 = @ptrCast(@alignCast(ctx.?));
             c.* += 1;
         }
@@ -259,6 +260,53 @@ fn benchEffectfulPerform(iters: usize) u64 {
     var handlers = HandlerSet.init(allocator);
     handlers.onPerform(BenchPerform, &struct {
         fn handle(_: *BenchPerform.Value, cont: *Cont(BenchPerform), _: *EffectContext, _: ?*anyopaque) void {
+            cont.@"resume"(42);
+        }
+    }.handle, null);
+
+    var entries: [N]*sched_mod.Scheduler.FiberEntry = undefined;
+    for (0..N) |i| {
+        entries[i] = sched.createFiber(&struct {
+            fn body(ctx: *EffectContext) void {
+                for (0..PerformN.count) |j| {
+                    const r = ctx.perform(BenchPerform, j);
+                    std.mem.doNotOptimizeAway(r);
+                }
+            }
+        }.body, 0) catch @panic("init");
+        sched.spawn(entries[i], &handlers) catch @panic("spawn");
+    }
+
+    const start = clockNs();
+    sched.run();
+    const elapsed = clockNs() - start;
+
+    for (0..N) |i| sched.destroyFiber(entries[i]);
+    handlers.deinit();
+    sched.deinit();
+    return elapsed;
+}
+
+// ============================================================
+// 4c. Effectful perform — slow path (handler yields before resuming)
+// ============================================================
+
+fn benchEffectfulPerformSlow(iters: usize) u64 {
+    const N = 10;
+    const M = iters / N;
+
+    const PerformN = struct {
+        threadlocal var count: usize = 0;
+    };
+    PerformN.count = M;
+
+    var sched = sched_mod.Scheduler.init(allocator, 1) catch @panic("OOM");
+
+    var handlers = HandlerSet.init(allocator);
+    // Handler emits before resuming — forces the slow path (handler fiber yields)
+    handlers.onPerform(BenchPerform, &struct {
+        fn handle(_: *BenchPerform.Value, cont: *Cont(BenchPerform), ctx: *EffectContext, _: ?*anyopaque) void {
+            ctx.emit(BenchEmit, 0);
             cont.@"resume"(42);
         }
     }.handle, null);
