@@ -105,9 +105,29 @@ pub fn Fiber(comptime YieldT: type, comptime ResumeT: type) type {
             self.state = .ready;
         }
 
+        /// Initialize a fiber in-place using a pre-allocated stack block.
+        /// The caller is responsible for guard page setup.
+        pub fn initFromBlock(self: *Self, body: BodyFn, block: [*]u8, block_size: usize, stack_size: usize, pool: *@import("pool.zig").StackPool) void {
+            Static.current_body = body;
+            var desc = coro.descInit(Wrapper.entry, 0);
+            coro.setUserData(&desc, @ptrCast(&Static.current_body));
+            pool.patchDesc(&desc);
+            coro.createFromBlock(&self.co, &desc, block, block_size, stack_size);
+            self.state = .ready;
+        }
+
         /// Initialize with default stack size (64KB).
         pub fn initDefault(self: *Self, body: BodyFn) !void {
             try self.init(body, 0);
+        }
+
+        /// Reset the fiber for reuse with a new body. The underlying
+        /// coroutine's stack must still be allocated (not destroyed).
+        /// After reset, the fiber can be started again with start().
+        pub fn reset(self: *Self, body: BodyFn) void {
+            Static.current_body = body;
+            coro.resetContext(&self.co);
+            self.state = .ready;
         }
 
         /// Destroy the fiber and free its stack. Idempotent —
@@ -164,6 +184,15 @@ pub fn Fiber(comptime YieldT: type, comptime ResumeT: type) type {
                 self.state = .dead;
                 return null;
             };
+            return self.afterResume();
+        }
+
+        /// Scheduler-optimized resume. No state checks, no TLS bookkeeping.
+        /// Works for both initial start and subsequent resumes. The caller
+        /// must ensure the fiber is in ready or suspended state.
+        pub fn schedulerResumeVoid(self: *Self) ?YieldT {
+            self.state = .running;
+            coro.schedulerResume(&self.co);
             return self.afterResume();
         }
 

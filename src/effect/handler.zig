@@ -148,23 +148,29 @@ pub const HandlerSet = struct {
     }
 
     /// Bind an effectful perform handler. The handler runs in its own
-    /// fiber and receives an EffectContext to re-perform effects that
-    /// propagate to the parent scope.
+    /// persistent fiber and receives an EffectContext to re-perform
+    /// effects that propagate to the parent scope. The fiber loops
+    /// across invocations — dispatch is a single context switch
+    /// (resumeVoid) after the first call.
     pub fn onPerform(self: *HandlerSet, comptime E: type, comptime handler: PerformHandlerFn(E), ctx: ?*anyopaque) void {
         const Gen = struct {
             fn fiber_body(ectx: *EffectContext) void {
-                const hctx = handler_fiber_ctx_tls;
-                const val: *E.Value = @ptrCast(@alignCast(hctx.raw.value_ptr));
-                var cont = Cont(E){
-                    .resume_ptr = hctx.raw.resume_ptr,
-                };
-                handler(val, &cont, ectx, hctx.user_ctx);
-                // Write outcome flags to shared context
-                hctx.resumed = cont.resumed;
-                hctx.dropped = cont.dropped;
-                hctx.delegated = cont.delegated;
-                if (cont.alive and !cont.delegated) {
-                    hctx.dropped = true; // auto-drop
+                while (true) {
+                    const hctx = handler_fiber_ctx_tls;
+                    const val: *E.Value = @ptrCast(@alignCast(hctx.raw.value_ptr));
+                    var cont = Cont(E){
+                        .resume_ptr = hctx.raw.resume_ptr,
+                    };
+                    handler(val, &cont, ectx, hctx.user_ctx);
+                    // Write outcome flags to shared context
+                    hctx.resumed = cont.resumed;
+                    hctx.dropped = cont.dropped;
+                    hctx.delegated = cont.delegated;
+                    if (cont.alive and !cont.delegated) {
+                        hctx.dropped = true; // auto-drop
+                    }
+                    // Yield sentinel — scheduler returns fiber to persistent cache
+                    _ = ectx.handle.yield(.{ .kind = .@"suspend", .id = types.SUSPEND_HANDLER_DONE });
                 }
             }
         };

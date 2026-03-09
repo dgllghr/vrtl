@@ -136,6 +136,12 @@ fn interceptNetWrite(userdata: ?*anyopaque, dest: net.Socket.Handle, header: []c
 
 const HandlerFiberCtx = handler_mod.HandlerFiberCtx;
 const initFiberPooled = types.initFiberPooled;
+const initFiberFromBlock = types.initFiberFromBlock;
+const resetFiberPooled = types.resetFiberPooled;
+
+/// Stack size for handler/observer fibers — one page of usable stack.
+/// Keeps handler blocks small (2 pages total: guard + stack).
+const HANDLER_STACK_SIZE: usize = std.heap.page_size_min;
 
 // ============================================================
 // Futex helpers (macOS __ulock)
@@ -226,9 +232,127 @@ const Inbox = struct {
     }
 };
 
-/// Intrusive freelist node overlaid on a dead FiberEntry for observer recycling.
-const ObserverNode = struct {
-    next: ?*ObserverNode,
+// ============================================================
+// IO Thread Pool
+// ============================================================
+
+/// Elastic thread pool for offloading blocking IO calls.
+/// Starts with a base number of threads and grows on demand when all
+/// threads are busy (prevents deadlock when long-running blocking calls
+/// like accept() exhaust the pool while read/write calls wait).
+const IoPool = struct {
+    const IoWork = struct {
+        run_fn: *const fn (*anyopaque) void,
+        ctx: *anyopaque,
+        entry: *Scheduler.FiberEntry,
+        worker: *Worker,
+        sched: *Scheduler,
+    };
+
+    mu: std.atomic.Mutex = .unlocked,
+    queue: std.ArrayListUnmanaged(IoWork) = .{},
+    /// Pending work count — pool threads futex-wait on this.
+    pending: u32 = 0,
+    /// Number of threads currently idle (waiting for work).
+    idle: u32 = 0,
+    /// Set to 1 to signal pool threads to exit.
+    stop_flag: u32 = 0,
+    threads: std.ArrayListUnmanaged(std.Thread) = .{},
+    allocator: std.mem.Allocator = undefined,
+
+    fn start(self: *IoPool, allocator: std.mem.Allocator, num_threads: u32) void {
+        self.allocator = allocator;
+        @atomicStore(u32, &self.stop_flag, 0, .release);
+        for (0..num_threads) |_| {
+            self.spawnOne();
+        }
+    }
+
+    fn spawnOne(self: *IoPool) void {
+        const t = std.Thread.spawn(.{ .stack_size = 64 * 1024 }, IoPool.poolThread, .{self}) catch @panic("failed to spawn IO pool thread");
+        spinLock(&self.mu);
+        self.threads.append(self.allocator, t) catch @panic("OOM: IoPool threads");
+        self.mu.unlock();
+    }
+
+    fn stop(self: *IoPool) void {
+        spinLock(&self.mu);
+        const n = self.threads.items.len;
+        self.mu.unlock();
+        if (n == 0) return;
+
+        @atomicStore(u32, &self.stop_flag, 1, .release);
+        // Set pending to non-zero so any pool thread that hasn't called
+        // futexWait yet will see *pending != 0 in the atomic compare,
+        // causing futexWait to return immediately instead of blocking.
+        // Without this, a thread between its stop_flag check and futexWait
+        // would miss the wakeAll and block forever.
+        @atomicStore(u32, &self.pending, 1, .release);
+        futexWakeAll(&self.pending);
+
+        // Snapshot thread list — no new threads can be spawned after stop_flag is set
+        spinLock(&self.mu);
+        const threads = self.threads.items;
+        for (threads) |t| {
+            t.join();
+        }
+        self.threads.deinit(self.allocator);
+        self.threads = .{};
+        self.mu.unlock();
+        self.queue.deinit(self.allocator);
+        self.queue = .{};
+    }
+
+    fn submit(self: *IoPool, work: IoWork) void {
+        spinLock(&self.mu);
+        self.queue.append(self.allocator, work) catch @panic("OOM: IoPool queue");
+        self.mu.unlock();
+
+        _ = @atomicRmw(u32, &self.pending, .Add, 1, .release);
+
+        // If no threads are idle, grow the pool to prevent deadlock
+        if (@atomicLoad(u32, &self.idle, .acquire) == 0) {
+            self.spawnOne();
+        } else {
+            futexWakeOne(&self.pending);
+        }
+    }
+
+    fn poolThread(self: *IoPool) void {
+        while (true) {
+            // Mark idle, wait for work
+            _ = @atomicRmw(u32, &self.idle, .Add, 1, .release);
+            while (true) {
+                if (@atomicLoad(u32, &self.stop_flag, .acquire) != 0) {
+                    _ = @atomicRmw(u32, &self.idle, .Sub, 1, .release);
+                    return;
+                }
+                const p = @atomicLoad(u32, &self.pending, .acquire);
+                if (p > 0) {
+                    if (@cmpxchgStrong(u32, &self.pending, p, p - 1, .acq_rel, .acquire) == null) {
+                        break; // claimed
+                    }
+                    continue;
+                }
+                futexWait(&self.pending, 0);
+            }
+            _ = @atomicRmw(u32, &self.idle, .Sub, 1, .release);
+
+            // Pop and execute work
+            spinLock(&self.mu);
+            const work = if (self.queue.items.len > 0) self.queue.pop() else null;
+            self.mu.unlock();
+
+            if (work) |w| {
+                w.run_fn(w.ctx);
+                w.entry.pending_io = null;
+                w.entry.pending_effect = .{ .kind = .@"suspend" };
+                w.worker.inbox.push(w.sched.allocator, w.entry);
+                @atomicStore(u32, &w.worker.park_state, PARK_NOTIFIED, .release);
+                futexWakeOne(&w.worker.park_state);
+            }
+        }
+    }
 };
 
 pub const Worker = struct {
@@ -240,8 +364,18 @@ pub const Worker = struct {
     parent: *Scheduler,
     rng_state: u32,
     park_state: u32 = PARK_RUNNING,
-    /// Per-worker freelist of recycled observer FiberEntries (avoids GPA alloc/free per emit).
-    observer_freelist: ?*ObserverNode = null,
+    /// Per-worker cache of recycled FiberEntries with stacks still attached.
+    /// Avoids both GPA alloc/free and StackPool churn for handler/observer fibers.
+    warm_cache: ?*Scheduler.FiberEntry = null,
+    /// Per-worker cache of persistent handler fibers (alive, parked at sentinel yield).
+    /// Keyed by binding's fiber_body pointer. Saves one context switch per invocation.
+    persistent: [MAX_PERSISTENT]?PersistentSlot = .{null} ** MAX_PERSISTENT,
+
+    const MAX_PERSISTENT = 8;
+    const PersistentSlot = struct {
+        key: EffectBodyFn,
+        entry: *Scheduler.FiberEntry,
+    };
 
     fn initWorker(alloc: std.mem.Allocator, id: u32, parent: *Scheduler) !Worker {
         return .{
@@ -253,35 +387,92 @@ pub const Worker = struct {
     }
 
     fn deinitWorker(self: *Worker) void {
-        self.pool.deinit();
+        // Drain deque first — fiber.deinit frees the stack block
+        // (which contains the entry in the unified layout).
         while (self.deque.pop()) |entry| {
             entry.fiber.deinit();
-            self.parent.allocator.destroy(entry);
         }
-        // Drain observer freelist
-        while (self.observer_freelist) |node| {
-            self.observer_freelist = node.next;
-            const entry: *Scheduler.FiberEntry = @ptrCast(@alignCast(node));
-            self.parent.allocator.destroy(entry);
+        // Drain warm cache — all cached entries use unified allocation.
+        // fiber.deinit munmaps the block containing the entry.
+        while (self.warm_cache) |entry| {
+            self.warm_cache = switch (entry.role) {
+                .cached => |next| next,
+                else => null,
+            };
+            entry.fiber.deinit();
         }
+        // Drain persistent cache — all persistent entries are unified.
+        for (&self.persistent) |*slot| {
+            if (slot.*) |s| {
+                s.entry.fiber.deinit();
+                slot.* = null;
+            }
+        }
+        // Now free all stacks from pool (after deque/cache are drained)
+        self.pool.deinit();
         self.deque.deinit();
         self.inbox.deinit(self.parent.allocator);
     }
 
-    /// Get a recycled observer FiberEntry, or allocate a new one.
-    fn allocObserver(self: *Worker) *Scheduler.FiberEntry {
-        if (self.observer_freelist) |node| {
-            self.observer_freelist = node.next;
-            return @ptrCast(@alignCast(node));
+    const WarmAllocResult = struct {
+        entry: *Scheduler.FiberEntry,
+        warm: bool,
+        /// Block base and size for cold-path init (undefined for warm hits).
+        block: [*]u8 = undefined,
+        block_size: usize = 0,
+    };
+
+    /// Get a cached FiberEntry (with stack attached), or allocate a unified
+    /// block from the pool (FiberEntry embedded at top of stack block).
+    fn warmAlloc(self: *Worker, stack_size: usize) WarmAllocResult {
+        if (self.warm_cache) |entry| {
+            self.warm_cache = switch (entry.role) {
+                .cached => |next| next,
+                else => null,
+            };
+            return .{ .entry = entry, .warm = true };
         }
-        return self.parent.allocator.create(Scheduler.FiberEntry) catch @panic("OOM");
+        // Cold path: allocate from pool with FiberEntry at top of block
+        const ps = Scheduler.PAGE_SIZE;
+        const usable = std.mem.alignForward(usize, @max(stack_size, ps), ps);
+        const block_size = ps + usable + Scheduler.ENTRY_SIZE;
+        const block = self.pool.allocBlock(block_size) orelse @panic("OOM");
+        const entry = Scheduler.entryFromBlock(block, block_size);
+        return .{ .entry = entry, .warm = false, .block = block, .block_size = block_size };
     }
 
-    /// Return an observer FiberEntry to the freelist for reuse.
-    fn freeObserver(self: *Worker, entry: *Scheduler.FiberEntry) void {
-        const node: *ObserverNode = @ptrCast(@alignCast(entry));
-        node.next = self.observer_freelist;
-        self.observer_freelist = node;
+    /// Return a FiberEntry (with its stack still attached) to the warm cache.
+    /// Do NOT call fiber.deinit before this — the stack stays allocated.
+    fn warmFree(self: *Worker, entry: *Scheduler.FiberEntry) void {
+        entry.role = .{ .cached = self.warm_cache };
+        self.warm_cache = entry;
+    }
+
+    /// Get a persistent handler fiber from the cache, keyed by binding body.
+    fn persistentGet(self: *Worker, key: EffectBodyFn) ?*FiberEntry {
+        for (&self.persistent) |*slot| {
+            if (slot.*) |s| {
+                if (s.key == key) {
+                    const entry = s.entry;
+                    slot.* = null;
+                    return entry;
+                }
+            }
+        }
+        return null;
+    }
+
+    /// Return a persistent handler fiber to the cache. The fiber is alive,
+    /// parked at the sentinel yield, ready for resumeVoid on next invocation.
+    fn persistentPut(self: *Worker, key: EffectBodyFn, entry: *FiberEntry) void {
+        for (&self.persistent) |*slot| {
+            if (slot.* == null) {
+                slot.* = .{ .key = key, .entry = entry };
+                return;
+            }
+        }
+        // Cache full — destroy excess fiber (unified block, no allocator.destroy)
+        entry.fiber.deinit();
     }
 
     /// xorshift32 PRNG for steal target selection.
@@ -318,9 +509,9 @@ pub const Worker = struct {
                 // Stolen entry that hasn't been started yet
                 if (entry.fiber.isSuspended()) {
                     activateFiber(entry);
-                    entry.pending_effect = entry.fiber.resumeVoid();
+                    entry.pending_effect = entry.fiber.schedulerResumeVoid();
                 } else {
-                    entry.pending_effect = entry.fiber.start();
+                    entry.pending_effect = entry.fiber.schedulerResumeVoid();
                 }
                 captureFiber(entry);
                 entry.pending_io = pending_io;
@@ -354,7 +545,7 @@ pub const Worker = struct {
                     // yielding, so the emitter can safely resume after all copies.
                     self.spawnEmitHandlers(&eff, entry.handlers);
                     activateFiber(entry);
-                    entry.pending_effect = entry.fiber.resumeVoid();
+                    entry.pending_effect = entry.fiber.schedulerResumeVoid();
                     captureFiber(entry);
                     entry.pending_io = pending_io;
                     pending_io = null;
@@ -377,6 +568,28 @@ pub const Worker = struct {
                         }
                         return;
                     }
+                    if (eff.id == types.SUSPEND_HANDLER_DONE) {
+                        // Persistent handler fiber completed (slow path).
+                        // Same as completeFiber for handlers, but return to persistent cache.
+                        switch (entry.role) {
+                            .handler => |hs| {
+                                const handler_ctx = hs.ctx;
+                                const origin = hs.origin_entry;
+                                const original_effect = hs.original_effect;
+                                const next_level = hs.next_level;
+                                const next_binding_idx = hs.next_binding_idx;
+                                self.persistentPut(hs.binding_body, entry);
+                                _ = @atomicRmw(isize, &sched.live_fibers, .Sub, 1, .release);
+                                self.handlePerformHandlerCompletion(origin, handler_ctx, original_effect, next_level, next_binding_idx);
+                                if (@atomicLoad(isize, &sched.live_fibers, .acquire) <= 0) {
+                                    @atomicStore(u32, &sched.shutdown, 1, .release);
+                                    sched.wakeAll();
+                                }
+                                return;
+                            },
+                            else => {}, // fall through to normal suspend handling
+                        }
+                    }
                     const pio = entry.pending_io orelse blk: {
                         const tls = pending_io;
                         pending_io = null;
@@ -391,7 +604,7 @@ pub const Worker = struct {
                     // No-op suspend — resume immediately
                     entry.pending_io = null;
                     activateFiber(entry);
-                    entry.pending_effect = entry.fiber.resumeVoid();
+                    entry.pending_effect = entry.fiber.schedulerResumeVoid();
                     captureFiber(entry);
                     entry.pending_io = pending_io;
                     pending_io = null;
@@ -409,31 +622,38 @@ pub const Worker = struct {
         const sched = self.parent;
 
         // Check if this was a handler fiber for an effectful perform
-        if (entry.origin_entry != null) {
-            // Capture state before freeing the entry
-            const handler_ctx = entry.handler_ctx;
-            const origin = entry.origin_entry.?;
-            const original_effect = entry.original_effect;
-            const next_level = entry.next_level;
-            const next_binding_idx = entry.next_binding_idx;
-            entry.fiber.deinit();
-            if (entry.owns_entry) {
-                self.freeObserver(entry);
-            }
-            _ = @atomicRmw(isize, &sched.live_fibers, .Sub, 1, .release);
-            // Handle the origin fiber's fate
-            self.handlePerformHandlerCompletion(origin, handler_ctx, original_effect, next_level, next_binding_idx);
-            // Check shutdown after handler completion (origin may have been re-enqueued)
-            if (@atomicLoad(isize, &sched.live_fibers, .acquire) <= 0) {
-                @atomicStore(u32, &sched.shutdown, 1, .release);
-                sched.wakeAll();
-            }
-            return;
+        switch (entry.role) {
+            .handler => |hs| {
+                // Capture state before caching the entry
+                const handler_ctx = hs.ctx;
+                const origin = hs.origin_entry;
+                const original_effect = hs.original_effect;
+                const next_level = hs.next_level;
+                const next_binding_idx = hs.next_binding_idx;
+                self.warmFree(entry);
+                _ = @atomicRmw(isize, &sched.live_fibers, .Sub, 1, .release);
+                // Handle the origin fiber's fate
+                self.handlePerformHandlerCompletion(origin, handler_ctx, original_effect, next_level, next_binding_idx);
+                // Check shutdown after handler completion (origin may have been re-enqueued)
+                if (@atomicLoad(isize, &sched.live_fibers, .acquire) <= 0) {
+                    @atomicStore(u32, &sched.shutdown, 1, .release);
+                    sched.wakeAll();
+                }
+                return;
+            },
+            else => {},
         }
 
-        entry.fiber.deinit();
-        if (entry.owns_entry) {
-            self.freeObserver(entry);
+        switch (entry.role) {
+            .observer => {
+                // Scheduler-internal fiber — warm cache for reuse
+                self.warmFree(entry);
+            },
+            .user => {
+                // User fiber — leave block allocated. User calls destroyFiber.
+            },
+            .handler => unreachable, // handled above
+            .cached => unreachable, // only set inside warm cache
         }
         const prev = @atomicRmw(isize, &sched.live_fibers, .Sub, 1, .release);
         if (prev <= 1) {
@@ -466,26 +686,17 @@ pub const Worker = struct {
         return null;
     }
 
-    /// Submit a fiber's IO to a background thread so the worker stays free.
+    /// Submit a fiber's IO to the IO thread pool so the worker stays free.
     fn submitIoWait(self: *Worker, entry: *FiberEntry) void {
         const sched = self.parent;
-        const worker_ptr = self;
-        const t = std.Thread.spawn(.{ .stack_size = 64 * 1024 }, struct {
-            fn run(w: *Worker, e: *FiberEntry, s: *Scheduler) void {
-                const io = e.pending_io.?;
-                io.run_fn(io.ctx);
-                e.pending_io = null;
-                e.pending_effect = .{ .kind = .@"suspend" };
-                w.inbox.push(s.allocator, e);
-                if (@cmpxchgStrong(u32, &w.park_state, PARK_PARKED, PARK_NOTIFIED, .release, .monotonic) == null) {
-                    futexWakeOne(&w.park_state);
-                }
-            }
-        }.run, .{ worker_ptr, entry, sched }) catch @panic("failed to spawn IO thread");
-
-        spinLock(&sched.io_threads_mu);
-        sched.io_threads.append(sched.allocator, t) catch @panic("OOM: io_threads append");
-        sched.io_threads_mu.unlock();
+        const io = entry.pending_io.?;
+        sched.io_pool.submit(.{
+            .run_fn = io.run_fn,
+            .ctx = io.ctx,
+            .entry = entry,
+            .worker = self,
+            .sched = sched,
+        });
     }
 
     /// Park this worker until notified.
@@ -529,9 +740,9 @@ pub const Worker = struct {
                 };
                 if (entry.fiber.isSuspended()) {
                     activateFiber(entry);
-                    entry.pending_effect = entry.fiber.resumeVoid();
+                    entry.pending_effect = entry.fiber.schedulerResumeVoid();
                 } else {
-                    entry.pending_effect = entry.fiber.start();
+                    entry.pending_effect = entry.fiber.schedulerResumeVoid();
                 }
                 captureFiber(entry);
                 // Capture pending_io before next fiber overwrites TLS
@@ -598,30 +809,33 @@ pub const Worker = struct {
                         .user_ctx = binding.ctx,
                     };
 
-                    // Create handler fiber
-                    const h_entry = self.allocObserver();
-                    initFiberPooled(&h_entry.fiber, &self.pool, binding.fiber_body) catch @panic("OOM: emit handler fiber");
+                    // Create handler fiber (warm cache reuses stack)
+                    const alloc = self.warmAlloc(HANDLER_STACK_SIZE);
+                    const h_entry = alloc.entry;
+                    if (alloc.warm) {
+                        resetFiberPooled(&h_entry.fiber, binding.fiber_body);
+                    } else {
+                        initFiberFromBlock(&h_entry.fiber, &self.pool, binding.fiber_body, alloc.block, alloc.block_size, Scheduler.usableStackInBlock(alloc.block_size));
+                    }
 
                     // Start fiber — it copies value and yields suspend
-                    var next_eff = h_entry.fiber.start();
+                    var next_eff = h_entry.fiber.schedulerResumeVoid();
 
                     // Skip the value-copy suspend
                     if (next_eff) |fe| {
                         if (fe.kind == .@"suspend") {
-                            next_eff = h_entry.fiber.resumeVoid();
+                            next_eff = h_entry.fiber.schedulerResumeVoid();
                         }
                     }
 
                     if (next_eff == null) {
                         // === FAST PATH: handler completed synchronously ===
-                        h_entry.fiber.deinit();
-                        self.freeObserver(h_entry);
+                        self.warmFree(h_entry);
                         continue;
                     }
 
                     // === SLOW PATH: handler yielded, needs async processing ===
-                    h_entry.owns_entry = true;
-                    h_entry.origin_entry = null; // not a perform handler
+                    h_entry.role = .observer;
                     h_entry.handlers = hs.parent orelse hs;
                     h_entry.pending_effect = next_eff;
                     h_entry.handle = active_fiber_handle;
@@ -679,7 +893,7 @@ pub const Worker = struct {
                 }
             }
 
-            // Effectful bindings — try inline first, fall back to async scheduling
+            // Effectful bindings — persistent fibers eliminate one context switch
             for (hs.effectful_bindings.items, 0..) |binding, idx| {
                 if (binding.id != eff.id) continue;
 
@@ -688,45 +902,78 @@ pub const Worker = struct {
                     if (sl == hs and idx < skip_effectful_idx) continue;
                 }
 
-                // Set up handler context on a temp entry (lives with the entry)
-                const h_entry = self.allocObserver();
-                h_entry.handler_ctx = .{
-                    .raw = eff, // valid during start(); fiber copies what it needs
-                    .user_ctx = binding.ctx,
-                };
-                handler_mod.handler_fiber_ctx_tls = &h_entry.handler_ctx;
-                initFiberPooled(&h_entry.fiber, &self.pool, binding.fiber_body) catch @panic("OOM");
+                // Try persistent cache first (one context switch via resumeVoid)
+                var h_entry: *FiberEntry = undefined;
+                var from_persistent = false;
 
-                // Start the handler fiber
-                const first_eff = h_entry.fiber.start();
+                if (self.persistentGet(binding.fiber_body)) |cached| {
+                    h_entry = cached;
+                    h_entry.role.handler.ctx = .{ .raw = eff, .user_ctx = binding.ctx };
+                    from_persistent = true;
+                } else {
+                    // Allocate new entry (warm cache or fresh)
+                    const alloc = self.warmAlloc(HANDLER_STACK_SIZE);
+                    h_entry = alloc.entry;
+                    h_entry.role = .{ .handler = .{
+                        .ctx = .{ .raw = eff, .user_ctx = binding.ctx },
+                        .origin_entry = undefined, // set in slow path only
+                        .original_effect = undefined,
+                        .next_level = undefined,
+                        .next_binding_idx = undefined,
+                        .binding_body = binding.fiber_body,
+                    } };
+                    if (alloc.warm) {
+                        resetFiberPooled(&h_entry.fiber, binding.fiber_body);
+                    } else {
+                        initFiberFromBlock(&h_entry.fiber, &self.pool, binding.fiber_body, alloc.block, alloc.block_size, Scheduler.usableStackInBlock(alloc.block_size));
+                    }
+                }
 
-                if (first_eff == null) {
+                handler_mod.handler_fiber_ctx_tls = &h_entry.role.handler.ctx;
+
+                // Resume (persistent) or start (new) the handler fiber
+                const first_eff_result = if (from_persistent)
+                    h_entry.fiber.schedulerResumeVoid()
+                else
+                    h_entry.fiber.schedulerResumeVoid();
+
+                // Check for fast-path completion (sentinel suspend from persistent body)
+                const is_done = if (first_eff_result) |fe|
+                    (fe.kind == .@"suspend" and fe.id == types.SUSPEND_HANDLER_DONE)
+                else
+                    false;
+
+                if (first_eff_result == null or is_done) {
                     // === FAST PATH: handler completed synchronously ===
-                    // No heap alloc, no deque push — handle outcome inline.
-                    const ctx = h_entry.handler_ctx;
-                    h_entry.fiber.deinit();
-                    self.freeObserver(h_entry);
+                    const ctx = h_entry.role.handler.ctx;
+                    if (is_done) {
+                        self.persistentPut(binding.fiber_body, h_entry);
+                    } else {
+                        // Fiber died unexpectedly — warm cache it
+                        self.warmFree(h_entry);
+                    }
 
                     if (ctx.delegated) continue; // try next binding
-                    if (ctx.resumed) return .{ .effect = origin_entry.fiber.resumeVoid() };
+                    if (ctx.resumed) return .{ .effect = origin_entry.fiber.schedulerResumeVoid() };
                     // Dropped or auto-drop — deinit origin (completeFiber handles cleanup)
                     origin_entry.fiber.deinit();
                     return .{ .effect = null };
                 }
 
                 // === SLOW PATH: handler yielded, needs async scheduling ===
-                h_entry.origin_entry = origin_entry;
-                h_entry.original_effect = eff.*;
-                h_entry.next_level = hs;
-                h_entry.next_binding_idx = idx + 1;
-                // Point hctx.raw at the entry's stable copy (original eff may be stack-local)
-                h_entry.handler_ctx.raw = &h_entry.original_effect;
+                h_entry.role.handler.origin_entry = origin_entry;
+                h_entry.role.handler.original_effect = eff.*;
+                h_entry.role.handler.next_level = hs;
+                h_entry.role.handler.next_binding_idx = idx + 1;
+                h_entry.role.handler.binding_body = binding.fiber_body;
+                // Point ctx.raw at the entry's stable copy (original eff may be stack-local)
+                h_entry.role.handler.ctx.raw = &h_entry.role.handler.original_effect;
 
-                h_entry.owns_entry = true;
                 h_entry.handlers = hs.parent orelse hs;
-                h_entry.pending_effect = first_eff;
+                h_entry.pending_effect = first_eff_result;
                 h_entry.handle = active_fiber_handle;
-                h_entry.pending_io = null;
+                h_entry.pending_io = pending_io;
+                pending_io = null;
 
                 // Push handler to deque, increment live_fibers
                 self.deque.push(h_entry) catch unreachable;
@@ -738,7 +985,7 @@ pub const Worker = struct {
         }
 
         // Chain exhausted — no handler accepted. Resume with zeroed value.
-        return .{ .effect = origin_entry.fiber.resumeVoid() };
+        return .{ .effect = origin_entry.fiber.schedulerResumeVoid() };
     }
 
     /// Called when a handler fiber completes. Handles the Cont outcome
@@ -783,10 +1030,14 @@ pub const Worker = struct {
             return;
         }
 
-        // Dropped or auto-drop — destroy origin fiber
-        origin.fiber.deinit();
-        if (origin.owns_entry) {
-            self.freeObserver(origin);
+        // Dropped or auto-drop — destroy origin fiber.
+        // For user fibers, leave the block for destroyFiber.
+        // For observer fibers, deinit immediately.
+        switch (origin.role) {
+            .user => {},
+            .observer => origin.fiber.deinit(),
+            .handler => origin.fiber.deinit(),
+            .cached => unreachable,
         }
         const prev = @atomicRmw(isize, &sched.live_fibers, .Sub, 1, .release);
         if (prev <= 1) {
@@ -808,8 +1059,7 @@ pub const Scheduler = struct {
     shutdown: u32 = 0,
     spawn_buffer: std.ArrayListUnmanaged(*FiberEntry),
     io_state: ?IoState = null,
-    io_threads_mu: std.atomic.Mutex = .unlocked,
-    io_threads: std.ArrayListUnmanaged(std.Thread) = .{},
+    io_pool: IoPool = .{},
 
     const IoState = struct {
         vtable: std.Io.VTable,
@@ -825,25 +1075,62 @@ pub const Scheduler = struct {
         }
     };
 
+    const PAGE_SIZE: usize = std.heap.page_size_min;
+
+    /// Size of FiberEntry, aligned to 16 bytes for stack alignment.
+    const ENTRY_SIZE: usize = std.mem.alignForward(usize, @sizeOf(FiberEntry), 16);
+
+    /// Derive a FiberEntry pointer from a stack block. The entry lives at
+    /// the top of the block (above the stack growth direction).
+    fn entryFromBlock(block: [*]u8, block_size: usize) *FiberEntry {
+        return @ptrCast(@alignCast(block + block_size - ENTRY_SIZE));
+    }
+
+    /// Usable stack size within a block after reserving space for the guard
+    /// page and the embedded FiberEntry.
+    fn usableStackInBlock(block_size: usize) usize {
+        return block_size - PAGE_SIZE - ENTRY_SIZE;
+    }
+
     pub const FiberEntry = struct {
-        fiber: EffectFiber,
-        handlers: *const HandlerSet,
-        handle: ?*EffectFiber.Handle,
+        // --- Cache line 0: dispatch loop hot path ---
+        // pending_effect, handle, pending_io are checked/updated every
+        // iteration of the dispatch loop in processEntry.
         pending_effect: ?RawEffect,
+        handle: ?*EffectFiber.Handle,
         pending_io: ?PendingIo = null,
-        /// If true, scheduler frees this entry on fiber death (observer fibers).
-        /// User-created entries (from createFiber) are false — user calls destroyFiber.
-        owns_entry: bool = false,
-        /// Handler outcome flags — lives on the entry so the fiber's pointer
-        /// to it (captured via TLS at start) remains valid for the entry's lifetime.
-        handler_ctx: HandlerFiberCtx = .{ .raw = undefined, .user_ctx = null },
-        /// Non-null for effectful perform handler fibers: the origin fiber's entry.
-        origin_entry: ?*FiberEntry = null,
-        /// Original effect — needed for re-dispatch on delegation.
-        original_effect: RawEffect = undefined,
-        /// Where to continue searching if handler delegates.
-        next_level: ?*const HandlerSet = null,
-        next_binding_idx: usize = 0,
+        handlers: *const HandlerSet,
+        // --- Cache line 1+: cold / setup ---
+        // fiber is large (~168 bytes) but only accessed on start/resume
+        // (once per processEntry call), not in the inner dispatch loop.
+        fiber: EffectFiber,
+        role: Role = .user,
+
+        const Role = union(enum) {
+            /// User-created fiber (via createFiber). User calls destroyFiber.
+            user,
+            /// Scheduler-internal fiber (emit observer, handler slow path).
+            /// Warm-cached on completion.
+            observer,
+            handler: HandlerState,
+            /// Next pointer in the per-worker warm cache.
+            cached: ?*FiberEntry,
+        };
+
+        const HandlerState = struct {
+            /// Handler outcome flags — lives on the entry so the fiber's
+            /// pointer to it (captured via TLS) remains valid for the lifetime.
+            ctx: HandlerFiberCtx,
+            /// The origin fiber's entry (the one that called perform).
+            origin_entry: *FiberEntry,
+            /// Copy of the effect — needed for re-dispatch on delegation.
+            original_effect: RawEffect,
+            /// Where to continue searching if handler delegates.
+            next_level: ?*const HandlerSet,
+            next_binding_idx: usize,
+            /// The binding's fiber body — used as key for persistent cache return.
+            binding_body: EffectBodyFn,
+        };
     };
 
     /// Initialize a scheduler with `num_workers` workers.
@@ -876,12 +1163,12 @@ pub const Scheduler = struct {
     }
 
     pub fn deinit(self: *Scheduler) void {
+        self.io_pool.stop();
         for (self.workers) |*w| {
             w.deinitWorker();
         }
         self.allocator.free(self.workers);
         self.spawn_buffer.deinit(self.allocator);
-        self.io_threads.deinit(self.allocator);
     }
 
     pub fn spawn(self: *Scheduler, entry: *FiberEntry, handlers: *const HandlerSet) !void {
@@ -934,38 +1221,44 @@ pub const Scheduler = struct {
         Static.current_body = body;
         Static.current_io = self.io_state.?.wrappedIo();
 
-        const entry = try self.allocator.create(FiberEntry);
+        // Unified block: [guard page | usable stack | FiberEntry]
+        const ps = PAGE_SIZE;
+        const raw_stack = if (stack_size == 0) 64 * 1024 else stack_size;
+        const usable = std.mem.alignForward(usize, @max(raw_stack, ps), ps);
+        const block_size = ps + usable + ENTRY_SIZE;
+        const block = self.workers[0].pool.allocBlock(block_size) orelse return error.OutOfMemory;
+        const entry = entryFromBlock(block, block_size);
 
-        // Always use worker 0's pool for createFiber (called from main thread)
-        try entry.fiber.initPooled(&struct {
-            fn wrapper(h: *EffectFiber.Handle) void {
+        initFiberFromBlock(&entry.fiber, &self.workers[0].pool, &struct {
+            fn wrapper(ctx: *EffectContext) void {
                 const b = Static.current_body;
                 const io = Static.current_io;
-                active_fiber_handle = h;
-                var ctx = EffectContext.initWithIo(h, io);
-                _ = h.yield(.{ .kind = .@"suspend" });
-                b(&ctx);
+                active_fiber_handle = ctx.handle;
+                ctx.io = io;
+                _ = ctx.handle.yield(.{ .kind = .@"suspend" });
+                b(ctx);
             }
-        }.wrapper, stack_size, &self.workers[0].pool);
+        }.wrapper, block, block_size, usableStackInBlock(block_size));
 
-        _ = entry.fiber.start();
+        _ = entry.fiber.schedulerResumeVoid();
 
         const handle = active_fiber_handle orelse @panic("createFiber: wrapper did not set active_fiber_handle");
 
         entry.handle = handle;
         entry.pending_effect = null;
         entry.pending_io = null;
-        entry.owns_entry = false;
-        entry.origin_entry = null;
+        entry.role = .user;
 
         return entry;
     }
 
     /// Destroy a fiber entry created by createFiber.
     /// Safe to call after run() — deinit is idempotent for dead fibers.
+    /// The entry pointer is invalid after this call (it lives in the
+    /// stack block that gets freed).
     pub fn destroyFiber(self: *Scheduler, entry: *FiberEntry) void {
+        _ = self;
         entry.fiber.deinit();
-        self.allocator.destroy(entry);
     }
 
     pub fn run(self: *Scheduler) void {
@@ -983,6 +1276,11 @@ pub const Scheduler = struct {
         }
         self.spawn_buffer.clearRetainingCapacity();
 
+        // Start IO thread pool if IO is configured
+        if (self.io_state != null) {
+            self.io_pool.start(self.allocator, self.num_workers * 2);
+        }
+
         // Spawn N-1 worker threads
         for (self.workers[1..]) |*w| {
             w.thread = std.Thread.spawn(.{}, Worker.threadEntry, .{w}) catch @panic("failed to spawn worker thread");
@@ -999,11 +1297,8 @@ pub const Scheduler = struct {
             }
         }
 
-        // Join all IO background threads
-        for (self.io_threads.items) |t| {
-            t.join();
-        }
-        self.io_threads.clearRetainingCapacity();
+        // Stop IO thread pool
+        self.io_pool.stop();
     }
 
     /// Wake one parked peer worker (not self).

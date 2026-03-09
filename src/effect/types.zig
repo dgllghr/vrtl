@@ -26,6 +26,10 @@ pub const EffectKind = enum(u8) { perform, emit, @"suspend" };
 /// park (not an IO suspend). The scheduler checks this to distinguish the two.
 pub const SUSPEND_WAKE: usize = 1;
 
+/// Sentinel: persistent handler fiber completed one invocation and is
+/// ready to be returned to the persistent cache.
+pub const SUSPEND_HANDLER_DONE: usize = 2;
+
 pub fn effectId(comptime E: type) usize {
     return @intFromPtr(@typeName(E).ptr);
 }
@@ -41,8 +45,6 @@ pub const RawEffect = struct {
     /// For perform: pointer to the resume slot on the performer's
     /// stack frame. The continuation writes the resume value here.
     resume_ptr: ?*anyopaque = null,
-    /// For emit: size of the value (needed for heap-copying in async dispatch).
-    value_size: usize = 0,
 };
 
 pub const EffectFiber = fiber_mod.Fiber(RawEffect, void);
@@ -70,20 +72,34 @@ pub fn initFiberDefault(fiber: *EffectFiber, body: EffectBodyFn) !void {
     try initFiber(fiber, body, 0);
 }
 
-/// Initialize an effect fiber in-place using a StackPool for allocation.
-pub fn initFiberPooled(fiber: *EffectFiber, pool: *@import("../pool.zig").StackPool, body: EffectBodyFn) !void {
-    const Static = struct {
-        threadlocal var current_body: EffectBodyFn = undefined;
-    };
-    Static.current_body = body;
+/// Threadlocal for passing the effect body to the pooled fiber wrapper.
+/// Module-level so both initFiberPooled and resetFiberPooled can share it.
+threadlocal var pooled_fiber_body: EffectBodyFn = undefined;
 
-    try fiber.initPooled(&struct {
-        fn wrapper(h: *EffectFiber.Handle) void {
-            const b = Static.current_body;
-            var ctx = EffectContext.init(h);
-            b(&ctx);
-        }
-    }.wrapper, 0, pool);
+fn pooledFiberWrapper(h: *EffectFiber.Handle) void {
+    const b = pooled_fiber_body;
+    var ctx = EffectContext.init(h);
+    b(&ctx);
+}
+
+/// Initialize an effect fiber in-place using a StackPool for allocation.
+pub fn initFiberPooled(fiber: *EffectFiber, pool: *@import("../pool.zig").StackPool, body: EffectBodyFn, stack_size: usize) !void {
+    pooled_fiber_body = body;
+    try fiber.initPooled(&pooledFiberWrapper, stack_size, pool);
+}
+
+/// Initialize an effect fiber in-place using a pre-allocated stack block.
+pub fn initFiberFromBlock(fiber: *EffectFiber, pool: *@import("../pool.zig").StackPool, body: EffectBodyFn, block: [*]u8, block_size: usize, stack_size: usize) void {
+    pooled_fiber_body = body;
+    fiber.initFromBlock(&pooledFiberWrapper, block, block_size, stack_size, pool);
+}
+
+/// Reset a pooled effect fiber for reuse with a new body. The fiber's
+/// stack must still be allocated (not destroyed). After reset, the fiber
+/// can be started again with start().
+pub fn resetFiberPooled(fiber: *EffectFiber, body: EffectBodyFn) void {
+    pooled_fiber_body = body;
+    fiber.reset(&pooledFiberWrapper);
 }
 
 // ============================================================
@@ -148,7 +164,6 @@ pub const EffectContext = struct {
             .id = effectId(E),
             .kind = .emit,
             .value_ptr = @ptrCast(&storage),
-            .value_size = @sizeOf(E.Value),
         });
     }
 

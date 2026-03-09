@@ -275,7 +275,7 @@ pub fn setGuardPage(addr: [*]align(std.heap.page_size_min) u8) !void {
 threadlocal var current_co: ?*Coro = null;
 
 const DEFAULT_STACK_SIZE: usize = 64 * 1024;
-const MIN_STACK_SIZE: usize = 16 * 1024;
+const MIN_STACK_SIZE: usize = PAGE_SIZE;
 
 pub fn descInit(func: EntryFn, stack_size: usize) Desc {
     return .{ .func = func, .stack_size = stack_size };
@@ -314,6 +314,23 @@ pub fn create(co: *Coro, desc: *Desc) CoroError!void {
     makeContext(co);
 }
 
+/// Initialize a coroutine using a pre-allocated stack block. The caller is
+/// responsible for guard page setup. `stack_size` is the usable area
+/// (block may be larger if the caller reserves space at the top).
+pub fn createFromBlock(co: *Coro, desc: *Desc, block: [*]u8, block_size: usize, stack_size: usize) void {
+    co.* = .{
+        .func = desc.func,
+        .user_data = desc.user_data,
+        .stack_base = block + PAGE_SIZE,
+        .stack_size = stack_size,
+        .block_base = block,
+        .block_size = block_size,
+        .dealloc_fn = desc.dealloc_fn orelse &defaultDealloc,
+        .dealloc_data = desc.allocator_data,
+    };
+    makeContext(co);
+}
+
 pub fn @"resume"(co: *Coro) CoroError!void {
     if (co.state != .suspended) return CoroError.NotSuspended;
 
@@ -330,10 +347,28 @@ pub fn @"resume"(co: *Coro) CoroError!void {
     co.prev_co = null;
 }
 
+/// Scheduler-optimized resume. Skips TLS bookkeeping (current_co,
+/// prev_co) and error checking. The caller must ensure co is suspended.
+/// The coroutine's yield path still sets co.state = .suspended, and
+/// coroEntry still sets co.state = .dead, so afterResume can read
+/// co.state to distinguish completion from suspension.
+pub inline fn schedulerResume(co: *Coro) void {
+    co.state = .running;
+    switchContext(&co.caller_ctx, &co.ctx);
+}
+
 pub fn yield(co: *Coro) CoroError!void {
     if (co.state != .running) return CoroError.NotRunning;
     co.state = .suspended;
     switchContext(&co.ctx, &co.caller_ctx);
+}
+
+/// Reset a coroutine's context for reuse. The stack block must still be
+/// valid (not destroyed). After reset, the coro is in the suspended state
+/// and will re-enter via the trampoline on next resume.
+pub fn resetContext(co: *Coro) void {
+    co.state = .suspended;
+    makeContext(co);
 }
 
 pub fn destroy(co: *Coro) CoroError!void {

@@ -21,8 +21,8 @@ pub fn WorkStealingDeque(comptime T: type) type {
         };
 
         buf: *BufRef,
-        top: isize = 0,
-        bottom: isize = 0,
+        bottom: isize align(std.atomic.cache_line) = 0,
+        top: isize align(std.atomic.cache_line) = 0,
         allocator: std.mem.Allocator,
 
         pub const StealResult = union(enum) {

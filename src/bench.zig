@@ -94,7 +94,7 @@ fn benchFiberCreateDestroyPooled(iters: usize) u64 {
         var f: EffectFiber = undefined;
         types.initFiberPooled(&f, &pool, &struct {
             fn body(_: *EffectContext) void {}
-        }.body) catch @panic("init");
+        }.body, 0) catch @panic("init");
         f.deinit();
     }
     return clockNs() - start;
@@ -461,12 +461,12 @@ fn benchDequeSteal(iters: usize) u64 {
         stolen: u64,
     };
 
+    var deque = Deque.init(allocator, 1024) catch @panic("OOM");
+    defer deque.deinit();
+
     const start = clockNs();
 
     for (0..iters) |_| {
-        var deque = Deque.init(allocator, 1024) catch @panic("OOM");
-        defer deque.deinit();
-
         var done: u32 = 0;
         var ctxs: [num_thieves]ThiefCtx = undefined;
         var threads: [num_thieves]std.Thread = undefined;
